@@ -1,0 +1,5729 @@
+  <?php
+  /** Services chercheur — tables $wpdb->prefix . 'recherche_<entite>' */
+  if (!defined('ABSPATH')) { exit; }
+
+  function svc_read_input(WP_REST_Request $req){
+    $data = $req->get_json_params();
+    if (empty($data) || !is_array($data)) { $data = $req->get_body_params(); }
+    if (empty($data) || !is_array($data)) { $data = $req->get_params(); }
+    return is_array($data) ? $data : array();
+  }
+
+  function svc_etablissements_list(WP_REST_Request $req){
+    global $wpdb;
+    $table = $wpdb->prefix . 'master_instituts'; // (id, nom)
+    $search = trim((string)$req->get_param('search'));
+    if ($search !== '') {
+      $like = '%' . $wpdb->esc_like($search) . '%';
+      return $wpdb->get_results($wpdb->prepare("SELECT id, nom FROM $table WHERE nom LIKE %s ORDER BY nom ASC", $like), ARRAY_A) ?: array();
+    }
+    return $wpdb->get_results("SELECT id, nom FROM $table ORDER BY nom ASC", ARRAY_A) ?: array();
+  }
+
+
+
+  // === Laboratoire ===
+function svc_laboratoire_table(){ global $wpdb; return $wpdb->prefix.'recherche_laboratoire'; }
+
+  /**
+   * Carte des champs autorisés + types (pour sanitation/format DB).
+   * Types supportés: int, email, url, date, enum, text, json
+   */
+  function svc_laboratoire_allowed(){
+    return array(
+      'logo_id'              => 'int',
+      'logo_url'             => 'url',
+      'denomination'         => 'text',
+      'code_lr'              => 'text',
+      'etablissement_id'     => 'int',
+      'etablissement_label'  => 'text',
+      'date_creation'        => 'date',
+      'directeur_nom'        => 'text',
+      'directeur_email'      => 'email',
+      'directeur_user_id'    => 'int',
+      'statut'               => array('enum', array('Actif','Inactif','Suspendu')),
+      'objectif_general'     => 'text',   // HTML nettoyé côté args REST si besoin
+      'axes_recherche'       => 'json',   // array<string> ⇄ JSON
+      'site_web'             => 'url',
+      'telephone'            => 'text',
+      'email_contact'        => 'email',
+      'meta_json'            => 'json',
+      // audit (remplis automatiquement)
+      'created_by'           => 'int',
+      'updated_by'           => 'int',
+    );
+  }
+
+  /** Sanitize un champ selon son type */
+  function svc_labo_sanitize($key, $val, $def){
+    $type = is_array($def) ? $def[0] : $def;
+    switch ($type){
+      case 'int':   return absint($val);
+      case 'email': return sanitize_email($val);
+      case 'url':   return esc_url_raw($val);
+      case 'date':  return (is_string($val) && preg_match('/^\d{4}-\d{2}-\d{2}$/', $val)) ? $val : null;
+      case 'enum':  return in_array($val, $def[1] ?? array(), true) ? $val : null;
+      case 'json':  return is_string($val) ? $val : wp_json_encode($val, JSON_UNESCAPED_UNICODE);
+      case 'text':
+      default:      return is_scalar($val) ? sanitize_text_field($val) : wp_json_encode($val, JSON_UNESCAPED_UNICODE);
+    }
+  }
+
+  /** Format SQL correspondant pour wpdb */
+  function svc_labo_format($def){
+    $type = is_array($def) ? $def[0] : $def;
+    switch ($type){
+      case 'int':  return '%d';
+      default:     return '%s';
+    }
+  }
+
+  /** Décode les champs JSON à la sortie */
+  function svc_labo_decode_out(array $row){
+    foreach (array('axes_recherche','meta_json') as $j){
+      if (isset($row[$j]) && $row[$j] !== null && $row[$j] !== ''){
+        $decoded = json_decode($row[$j], true);
+        if (json_last_error() === JSON_ERROR_NONE) $row[$j] = $decoded;
+      }
+    }
+    return $row;
+  }
+
+
+/*
+  // === laboratoire ===
+  function svc_laboratoire_get(WP_REST_Request $req){
+
+    global $wpdb; $table = svc_laboratoire_table(); $id = intval($req['id']);
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    if(!$row) return new WP_Error('not_found','Not found',array('status'=>404));
+    return svc_labo_decode_out($row);
+  }
+*/
+function svc_laboratoire_get(WP_REST_Request $req){
+    global $wpdb;
+
+    $table_labo = svc_laboratoire_table();
+    $u_tbl      = $wpdb->users;
+    $um_tbl     = $wpdb->usermeta;
+
+    $id = absint($req['id']);
+
+    // On joint users + usermeta (first_name, last_name, avatar_url/profile_photo)
+    $sql = $wpdb->prepare("
+        SELECT  l.*,
+                u.user_email                         AS directeur_email,
+                u.display_name                       AS directeur_display_name,
+                fn.meta_value                        AS directeur_first_name,
+                ln.meta_value                        AS directeur_last_name,
+                COALESCE(ava.meta_value, pho.meta_value, '') AS directeur_avatar_meta
+        FROM $table_labo l
+        LEFT JOIN $u_tbl u
+               ON u.ID = l.directeur_user_id
+        LEFT JOIN $um_tbl fn
+               ON fn.user_id = u.ID AND fn.meta_key = 'first_name'
+        LEFT JOIN $um_tbl ln
+               ON ln.user_id = u.ID AND ln.meta_key = 'last_name'
+        LEFT JOIN $um_tbl ava
+               ON ava.user_id = u.ID AND ava.meta_key = 'avatar_url'
+        LEFT JOIN $um_tbl pho
+               ON pho.user_id = u.ID AND pho.meta_key = 'profile_photo'
+        WHERE l.id = %d
+        LIMIT 1
+    ", $id);
+
+    $row = $wpdb->get_row($sql, ARRAY_A);
+    if (!$row) return new WP_Error('not_found', 'Not found', ['status'=>404]);
+
+    // Fallbacks UX
+    $uid = isset($row['directeur_user_id']) ? (int)$row['directeur_user_id'] : 0;
+
+    $first = trim((string)($row['directeur_first_name'] ?? ''));
+    $last  = trim((string)($row['directeur_last_name']  ?? ''));
+    $full  = trim(($first ? $first.' ' : '').$last);
+
+    if ($full === '') {
+        // si pas de first/last, on garde display_name
+        $full = isset($row['directeur_display_name']) && $row['directeur_display_name'] !== ''
+              ? $row['directeur_display_name']
+              : '';
+    }
+
+    // avatar : avatar_url > profile_photo > get_avatar_url()
+    $avatar = trim((string)($row['directeur_avatar_meta'] ?? ''));
+    if ($avatar === '' && $uid) {
+        // essaie usermeta direct si non joint, puis gravatar WP
+        $avatar = get_user_meta($uid, 'avatar_url', true);
+        if (!$avatar) $avatar = get_user_meta($uid, 'profile_photo', true);
+        if (!$avatar) $avatar = get_avatar_url($uid);
+    }
+
+    // Pose les champs finaux attendus par le front
+    $row['directeur_first_name']  = $first;
+    $row['directeur_last_name']   = $last;
+    $row['directeur_nom']         = $full;          // nom complet (ou display_name)
+    $row['directeur_avatar']      = $avatar ?: '';  // URL finale de l’image
+
+    // Décodages éventuels (axes_recherche/meta_json, etc.)
+    return svc_labo_decode_out($row);
+}
+
+  function svc_laboratoire_createOLD(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_laboratoire_table();
+    $allowed = svc_laboratoire_allowed();
+    $data = svc_read_input($req);
+
+    $ins = array(); $formats = array();
+
+    foreach ($allowed as $k => $def){
+      if (!isset($data[$k])) continue;
+      $val = svc_labo_sanitize($k, $data[$k], $def);
+      if ($val === null || $val === '') continue;
+      $ins[$k] = $val;
+      $formats[] = svc_labo_format($def);
+    }
+
+    // 🔹 Gestion fichier logo (clé "logo_file" côté formulaire <input type="file" name="logo_file">)
+    $files = $req->get_file_params();
+    if (!empty($files['logo_file']) && $files['logo_file']['error'] === UPLOAD_ERR_OK) {
+        $upload_dir = wp_upload_dir();
+        $target_dir = trailingslashit($upload_dir['basedir']).'logolabo/';
+
+        if (!file_exists($target_dir)) {
+            wp_mkdir_p($target_dir);
+        }
+
+        $filename = sanitize_file_name($files['logo_file']['name']);
+        $target_path = $target_dir . $filename;
+
+        if (move_uploaded_file($files['logo_file']['tmp_name'], $target_path)) {
+            $file_url = trailingslashit($upload_dir['baseurl']).'logolabo/'.$filename;
+            $ins['logo_url'] = esc_url_raw($file_url);   // URL publique
+            $formats[] = '%s';
+        }
+    }
+  // 🔹 Associer automatiquement le directeur
+    $ins['directeur_user_id'] = get_current_user_id(); $formats[] = '%d';
+    // Audit
+    $ins['created_by'] = get_current_user_id(); $formats[] = '%d';
+    $ins['updated_by'] = get_current_user_id(); $formats[] = '%d';
+
+    $ins['etablissement_id']= get_user_meta(get_current_user_id(), 'institut_id', true);
+
+
+    if(empty($ins)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->insert($table, $ins, $formats);
+    if(!$ok) return new WP_Error('db_error','Insert failed',array('status'=>500));
+    $id = $wpdb->insert_id;
+
+    $out = array('id'=>$id) + $ins;
+    return svc_labo_decode_out($out);
+  }
+
+
+  function svc_laboratoire_update(WP_REST_Request $req){
+    global $wpdb;
+    $table   = svc_laboratoire_table();
+    $allowed = svc_laboratoire_allowed();
+
+    $id = intval($req['id'] ?? 0);
+    if ($id <= 0) return new WP_Error('bad_request','Invalid id', array('status'=>400));
+
+    // Récupère TOUT (multipart/form-data ou JSON)
+    $data  = $req->get_params();          // champs texte
+    $files = $req->get_file_params();     // fichiers
+
+    // --- Normaliser axes_recherche en array<string> ---
+    if (array_key_exists('axes_recherche', $data)) {
+      $axes = $data['axes_recherche'];
+      if (is_array($axes)) {
+        $axes = array_values(array_filter(array_map('trim',$axes), fn($s)=>$s!==''));
+      } elseif (is_string($axes)) {
+        $s = trim($axes);
+        if ($s === '') {
+          $axes = array();
+        } else {
+          $decoded = json_decode($s, true);
+          if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+            $axes = array_values(array_filter(array_map('trim',$decoded), fn($s)=>$s!==''));
+          } else {
+            $parts = preg_split('/\r?\n|,/', $s);
+            $axes  = array_values(array_filter(array_map('trim',$parts), fn($s)=>$s!==''));
+          }
+        }
+      } else {
+        $axes = array();
+      }
+      $data['axes_recherche'] = $axes; // array propre
+    }
+
+    $upd     = array();
+    $formats = array();
+
+    // Sanitize + mapping formats pour tous les champs autorisés envoyés
+    foreach ($allowed as $k => $def){
+      if (!array_key_exists($k, $data)) continue;
+      $val = svc_labo_sanitize($k, $data[$k], $def);
+      if ($val === null) continue;         // pas de set à NULL par défaut
+
+      // Encoder JSON pour ces colonnes si besoin
+      if (($k === 'axes_recherche' || $k === 'meta_json') && !is_string($val)) {
+        $val = wp_json_encode($val, JSON_UNESCAPED_UNICODE);
+      }
+
+      $upd[$k]   = $val;
+      $formats[] = svc_labo_format($def);  // %d ou %s
+    }
+
+    // --- Upload fichier logo (clé: logo_file) ---
+    if (!empty($files['logo_file']) && $files['logo_file']['error'] === UPLOAD_ERR_OK) {
+      $upload_dir = wp_upload_dir();
+      $target_dir = trailingslashit($upload_dir['basedir']).'logolabo/';
+      if (!file_exists($target_dir)) wp_mkdir_p($target_dir);
+
+      $filename = sanitize_file_name($files['logo_file']['name']);
+      $filename = wp_unique_filename($target_dir, $filename); // évite l’écrasement
+      $target_path = $target_dir . $filename;
+
+      if (!@move_uploaded_file($files['logo_file']['tmp_name'], $target_path)) {
+        return new WP_Error('upload_failed','Échec déplacement du fichier uploadé', array('status'=>500));
+      }
+      $file_url = trailingslashit($upload_dir['baseurl']).'logolabo/'.$filename;
+      $upd['logo_url'] = esc_url_raw($file_url);
+      $formats[] = '%s';
+    }
+/*
+    // --- Associer automatiquement le directeur & l’établissement courant ---
+    $current_uid = get_current_user_id();
+    if ($current_uid) {
+      $upd['directeur_user_id'] = $current_uid;   $formats[] = '%d';
+      $inst = get_user_meta($current_uid, 'institut_id', true);
+      if ($inst !== '' && $inst !== null) {
+        $upd['etablissement_id'] = (int)$inst;    $formats[] = '%d';
+      }
+    }
+*/
+    // --- Audit ---
+   // $upd['updated_by'] = $current_uid;            $formats[] = '%d';
+
+    if (empty($upd)) return new WP_Error('bad_request','No valid fields', array('status'=>400));
+
+    // --- UPDATE ---
+    $ok = $wpdb->update($table, $upd, array('id'=>$id), $formats, array('%d'));
+    if ($ok === false) {
+      error_log('[svc_laboratoire_update] DB ERROR: '.$wpdb->last_error);
+      return new WP_Error('db_error', 'Update failed: '.$wpdb->last_error, array('status'=>500));
+    }
+
+    // --- Retour enrichi (row complète décodée) ---
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    if ($row) $row = svc_labo_decode_out($row);
+    return $row ?: (array('id'=>$id) + $upd);
+  }
+
+
+function svc_laboratoire_update_directeur(WP_REST_Request $req){
+  global $wpdb;
+  $table = svc_laboratoire_table();
+
+  // --- sécurité de base
+  $uid = get_current_user_id();
+  if (!$uid) return new WP_Error('forbidden','Utilisateur non connecté',['status'=>403]);
+
+  $id = absint($req['id'] ?? 0);
+  if ($id <= 0) return new WP_Error('bad_request','ID laboratoire invalide',['status'=>400]);
+
+  // --- params
+  $directeur_user_id = $req->get_param('directeur_user_id');
+  if ($directeur_user_id === null || $directeur_user_id === '') {
+    return new WP_Error('bad_request','Paramètre directeur_user_id manquant',['status'=>400]);
+  }
+  $directeur_user_id = absint($directeur_user_id);
+  if ($directeur_user_id <= 0) {
+    return new WP_Error('bad_request','directeur_user_id invalide',['status'=>400]);
+  }
+
+  // --- vérifier existence labo (on récupère directeur actuel)
+  $lab = $wpdb->get_row(
+    $wpdb->prepare("SELECT id, etablissement_id, directeur_user_id, denomination FROM $table WHERE id=%d",$id),
+    ARRAY_A
+  );
+  if (!$lab) return new WP_Error('not_found','Laboratoire introuvable',['status'=>404]);
+
+  // --- si le même directeur est déjà affecté à ce labo -> rien à faire
+  if ((int)$lab['directeur_user_id'] === $directeur_user_id){
+    // renvoie l’état actuel enrichi
+    $u_now = $lab['directeur_user_id'] ? get_user_by('id', (int)$lab['directeur_user_id']) : null;
+    $lab['directeur_nom']    = $u_now ? $u_now->display_name : null;
+    $lab['directeur_email']  = $u_now ? $u_now->user_email   : null;
+    $lab['directeur_avatar'] = $u_now ? get_avatar_url($u_now->ID) : null;
+    return new WP_REST_Response($lab, 200);
+  }
+
+  // --- vérifier existence user
+  $u = get_user_by('id', $directeur_user_id);
+  if (!$u) return new WP_Error('not_found','Utilisateur (directeur) introuvable',['status'=>404]);
+
+  // (optionnel) vérifier le rôle
+  $roles = (array)($u->roles ?? []);
+  if (!in_array('um_directeur_laboratoire', $roles, true)) {
+    return new WP_Error('role_mismatch',"L'utilisateur sélectionné n'a pas le rôle 'um_directeur_laboratoire'.",['status'=>400]);
+  }
+
+  // (optionnel) vérifier même établissement (usermeta 'institut_id')
+  $user_institut = get_user_meta($directeur_user_id, 'institut_id', true);
+  if ($user_institut !== '' && $user_institut !== null) {
+    if ((int)$user_institut !== (int)$lab['etablissement_id']) {
+      return new WP_Error('institut_mismatch',"Le directeur choisi n'appartient pas au même établissement que le labo.",['status'=>400]);
+    }
+  }
+
+  // === CONTRAINTE : directeur déjà affecté à un autre labo ? ===
+  $conflict = $wpdb->get_row(
+    $wpdb->prepare(
+      "SELECT id, denomination FROM $table WHERE directeur_user_id = %d AND id <> %d LIMIT 1",
+      $directeur_user_id, $id
+    ),
+    ARRAY_A
+  );
+  if ($conflict){
+    $msg = sprintf(
+      "Impossible d'affecter ce directeur : il est déjà rattaché au laboratoire #%d%s.",
+      (int)$conflict['id'],
+      !empty($conflict['denomination']) ? " (« {$conflict['denomination']} »)" : ''
+    );
+    return new WP_Error('director_already_assigned', $msg, ['status'=>409, 'conflict_lab'=>$conflict]);
+  }
+
+  // --- mise à jour minimale
+  $data = [
+    'directeur_user_id' => $directeur_user_id,
+    'updated_by'        => $uid,
+    'updated_at'        => current_time('mysql'),
+  ];
+  $fmt  = ['%d','%d','%s'];
+
+  $ok = $wpdb->update($table, $data, ['id'=>$id], $fmt, ['%d']);
+  if ($ok === false) {
+    return new WP_Error('db_error','Échec mise à jour directeur',['status'=>500,'mysql_error'=>$wpdb->last_error]);
+  }
+
+  // --- retour enrichi
+  $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d",$id), ARRAY_A);
+  if ($row) {
+    $row['directeur_nom']    = $u->display_name;
+    $row['directeur_email']  = $u->user_email;
+    $row['directeur_avatar'] = get_avatar_url($u->ID);
+  }
+  return new WP_REST_Response($row ?: ['id'=>$id,'directeur_user_id'=>$directeur_user_id], 200);
+}
+
+
+
+
+
+  function svc_laboratoire_delete(WP_REST_Request $req){
+    global $wpdb; $table = svc_laboratoire_table(); $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id), array('%d'));
+    if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+
+function svc_laboratoire_list(WP_REST_Request $req){
+  global $wpdb;
+  $table_labo   = svc_laboratoire_table(); // ex: "{$wpdb->prefix}utm_recherche_laboratoire"
+  $table_inst   = "{$wpdb->prefix}master_instituts";
+  $table_users  = $wpdb->users;
+  $table_umeta  = $wpdb->usermeta;
+
+  // === Contexte utilisateur / rôles
+  $current_user = wp_get_current_user();
+  $uid   = get_current_user_id();
+  $roles = (array) ($current_user->roles ?? []);
+  $is_service_etab = in_array('um_service_etablissement', $roles, true) || in_array('um_service-etablissement', $roles, true);
+
+  // === Paramètres de pagination
+  $page = max(1, intval($req->get_param('page') ?: 1));
+  $per  = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+  $off  = ($page - 1) * $per;
+
+  // === Filtres
+  $where  = array();
+  $params = array();
+
+  // statut
+  if ($statut = $req->get_param('statut')){
+    $where[] = "l.statut = %s";
+    $params[] = $statut;
+  }
+
+  // établissement (id numérique) — filtre explicite
+  if ($eid = $req->get_param('etablissement_id')){
+    $where[] = "l.etablissement_id = %d";
+    $params[] = intval($eid);
+  }
+
+  // recherche fulltext simple
+  if ($q = trim((string)$req->get_param('search'))){
+    $qLike = '%' . $wpdb->esc_like($q) . '%';
+    $where[] = "(l.denomination LIKE %s OR l.code_lr LIKE %s OR i.nom LIKE %s OR COALESCE(CONCAT(um1.meta_value,' ',um2.meta_value), u.display_name) LIKE %s)";
+    array_push($params, $qLike, $qLike, $qLike, $qLike);
+  }
+
+  // me=1 => restreint aux labos du user connecté (directeur)
+  if (filter_var($req->get_param('me'), FILTER_VALIDATE_BOOLEAN)) {
+    $where[] = "l.directeur_user_id = %d";
+    $params[] = $uid;
+  }
+
+  // 🔒 Contrainte rôle "um_service_etablissement" : forcer l'établissement du user (usermeta: institut_id)
+  if ($is_service_etab) {
+    $inst_id = get_user_meta($uid, 'institut_id', true);
+    if ($inst_id === '' || $inst_id === null) {
+      return new WP_Error('no_institut_id', "Aucun 'institut_id' n'est associé à votre compte.", ['status'=>403]);
+    }
+    // On impose l'établissement du user connecté
+    $where[]  = "l.etablissement_id = %d";
+    $params[] = (int) $inst_id;
+  }
+
+  $wsql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
+
+  // === Tri
+  $orderby = $req->get_param('orderby') ?: 'id';
+  $order   = strtoupper($req->get_param('order') ?: 'DESC');
+
+  $allowedOrderBy = array('id','denomination','code_lr','domaine','date_creation','created_at','updated_at','etablissement_nom','directeur_nom');
+  if (!in_array($orderby, $allowedOrderBy, true)) $orderby = 'id';
+  if (!in_array($order, array('ASC','DESC'), true)) $order = 'DESC';
+
+  // === Meta key pour l'avatar
+  $AVATAR_META_KEY = 'avatar_url';
+
+  // === Requête principale
+  $sql = "
+    SELECT
+      l.*,
+      l.domaine AS domaine,
+      i.nom AS etablissement_nom,
+      u.ID            AS directeur_wp_id,
+      u.user_email    AS directeur_email,
+      u.display_name  AS directeur_display_name,
+      um1.meta_value  AS first_name,
+      um2.meta_value  AS last_name,
+      um3.meta_value  AS avatar_url,
+      um4.meta_value  AS tel,
+      TRIM(
+        COALESCE(
+          NULLIF(CONCAT(um1.meta_value,' ',um2.meta_value), ' '),
+          u.display_name
+        )
+      ) AS directeur_nom
+    FROM $table_labo l
+    LEFT JOIN $table_inst  i   ON i.id = l.etablissement_id
+    LEFT JOIN $table_users u   ON u.ID = l.directeur_user_id
+    LEFT JOIN $table_umeta um1 ON (um1.user_id = u.ID AND um1.meta_key = 'first_name')
+    LEFT JOIN $table_umeta um2 ON (um2.user_id = u.ID AND um2.meta_key = 'last_name')
+    LEFT JOIN $table_umeta um3 ON (um3.user_id = u.ID AND um3.meta_key = %s)
+    LEFT JOIN $table_umeta um4 ON (um4.user_id = u.ID AND um4.meta_key = 'tel')
+
+    $wsql
+    ORDER BY $orderby $order
+    LIMIT %d OFFSET %d
+  ";
+
+
+  //var_dump($sql);
+
+  // Params: meta_key avatar, filtres, pagination
+  array_unshift($params, $AVATAR_META_KEY);
+  $params[] = $per;
+  $params[] = $off;
+
+  $rows = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A) ?: array();
+
+  // Post-traitement (avatar fallback + décodage éventuel)
+  foreach ($rows as &$r){
+    if (empty($r['avatar_url']) && !empty($r['directeur_wp_id'])) {
+      $r['avatar_url'] = get_avatar_url((int)$r['directeur_wp_id']);
+    }
+  }
+  unset($r);
+
+  $rows = array_map('svc_labo_decode_out', $rows);
+
+  return $rows;
+}
+
+
+
+
+/*
+  function svc_laboratoire_mine(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_laboratoire_table();
+    $uid   = get_current_user_id();
+
+    $sql = "
+      SELECT l.*,
+            i.nom AS etablissement_nom,
+            u.display_name,
+            um1.meta_value AS first_name,
+            um2.meta_value AS last_name
+      FROM $table l
+      LEFT JOIN {$wpdb->prefix}master_instituts i ON l.etablissement_id = i.id
+      LEFT JOIN {$wpdb->users} u ON l.directeur_user_id = u.ID
+      LEFT JOIN {$wpdb->usermeta} um1 ON (u.ID = um1.user_id AND um1.meta_key = 'first_name')
+      LEFT JOIN {$wpdb->usermeta} um2 ON (u.ID = um2.user_id AND um2.meta_key = 'last_name')
+      WHERE l.directeur_user_id = %d
+      ORDER BY l.id DESC
+      LIMIT 1
+    ";
+
+
+    $row = $wpdb->get_row($wpdb->prepare($sql, $uid), ARRAY_A);
+    if(!$row) return [];
+
+    $row = svc_labo_decode_out($row);
+    $row['directeur_nom_complet'] = trim(($row['first_name'] ?? '').' '.($row['last_name'] ?? ''));
+    return $row;
+  }
+*/
+function svc_labo_projets(WP_REST_Request $req){
+  global $wpdb; 
+  $labo_id = intval($req['id']);
+  $table   = $wpdb->prefix . 'recherche_projet';
+  $table_labo = $wpdb->prefix . 'recherche_laboratoire';
+
+  $sql = $wpdb->prepare("
+    SELECT p.id, p.titre, p.statut, p.type_financement, p.budget, p.date_debut, p.date_fin
+    FROM $table p
+    LEFT JOIN $table_labo l ON p.chercheur_id = l.directeur_user_id
+    WHERE l.id  = %d
+    ORDER BY p.id DESC
+  ", $labo_id);
+
+
+
+  $rows = $wpdb->get_results($sql, ARRAY_A);
+  return $rows ?: [];
+}
+
+function svc_laboratoire_mine(WP_REST_Request $req){
+  global $wpdb; 
+  $table = svc_laboratoire_table();
+  $uid   = get_current_user_id();
+  $user  = wp_get_current_user();
+  $roles = (array) $user->roles;
+
+  // Helper SELECT commun (on réutilise le même SELECT partout)
+  $select_sql = "
+    SELECT l.*,
+           i.nom AS etablissement_nom,
+           u.display_name,
+           um1.meta_value AS first_name,
+           um2.meta_value AS last_name
+    FROM $table l
+    LEFT JOIN {$wpdb->prefix}master_instituts i ON l.etablissement_id = i.id
+    LEFT JOIN {$wpdb->users} u ON l.directeur_user_id = u.ID
+    LEFT JOIN {$wpdb->usermeta} um1 ON (u.ID = um1.user_id AND um1.meta_key = 'first_name')
+    LEFT JOIN {$wpdb->usermeta} um2 ON (u.ID = um2.user_id AND um2.meta_key = 'last_name')
+  ";
+
+  // ---- Cas 1 : Directeur de labo (comme avant)
+  if (in_array('um_directeur_laboratoire', $roles, true)) {
+    $sql = $select_sql . " WHERE l.directeur_user_id = %d ORDER BY l.id DESC LIMIT 1";
+    $row = $wpdb->get_row($wpdb->prepare($sql, $uid), ARRAY_A);
+  }
+  // ---- Cas 2 : Chercheur (comme avant)
+  elseif (in_array('um_chercheur', $roles, true)) {
+    $membre_table = svc_membre_table();
+    $sql = "
+      $select_sql
+      INNER JOIN $membre_table m ON l.id = m.laboratoire_id
+      WHERE m.user_id = %d
+      ORDER BY l.id DESC
+      LIMIT 1
+    ";
+    $row = $wpdb->get_row($wpdb->prepare($sql, $uid), ARRAY_A);
+  }
+  // ---- Cas 3 : Service UTM / Service Établissement => lire ?id=... depuis la requête
+  elseif (in_array('um_service_utm', $roles, true) || in_array('um_service-utm', $roles, true)
+       || in_array('um_service_etablissement', $roles, true) || in_array('um_service-etablissement', $roles, true)) {
+
+    $lab_id = absint($req->get_param('id'));
+    if (!$lab_id) {
+      return new WP_Error('missing_id', "Paramètre 'id' manquant dans l'URL (ex: /fiche-de-details-de-laboratoire/?id=18).", ['status'=>400]);
+    }
+
+    // Si service établissement -> restreindre à son institut
+    if (in_array('um_service_etablissement', $roles, true) || in_array('um_service-etablissement', $roles, true)) {
+      $inst_id = get_user_meta($uid, 'institut_id', true);
+      if ($inst_id === '' || $inst_id === null) {
+        return new WP_Error('no_institut_id', "Aucun 'institut_id' associé à votre compte.", ['status'=>403]);
+      }
+      $sql = $select_sql . " WHERE l.id = %d AND l.etablissement_id = %d LIMIT 1";
+      $row = $wpdb->get_row($wpdb->prepare($sql, $lab_id, (int)$inst_id), ARRAY_A);
+    } else {
+      // Service UTM : accès global
+      $sql = $select_sql . " WHERE l.id = %d LIMIT 1";
+      $row = $wpdb->get_row($wpdb->prepare($sql, $lab_id), ARRAY_A);
+    }
+  }
+  // ---- Autres rôles : rien
+  else {
+    return [];
+  }
+
+  if (!$row) return [];
+
+  // Décodage / enrichissement
+  $row = svc_labo_decode_out($row);
+  $row['directeur_nom_complet'] = trim(($row['first_name'] ?? '').' '.($row['last_name'] ?? ''));
+
+  return $row;
+}
+
+function svc_labo_effectifs(WP_REST_Request $req){
+    global $wpdb;
+    $labo_id = intval($req['id']);
+
+    $table_membre = $wpdb->prefix . 'recherche_membre';   // utm_recherche_membre
+    $table_umeta  = $wpdb->prefix . 'usermeta';           // wp_usermeta
+    $table_grade  = $wpdb->prefix . 'grade';              // utm_grade
+
+    // --- Requête : lier membre → usermeta(grade_id) → grade ---
+    $sql = $wpdb->prepare("
+        SELECT g.intitule AS grade, COUNT(*) AS total
+        FROM $table_membre m
+        INNER JOIN $table_umeta um ON um.user_id = m.user_id AND um.meta_key = 'grade_id'
+        INNER JOIN $table_grade g ON g.id = um.meta_value
+        WHERE m.laboratoire_id = %d
+        GROUP BY g.id, g.intitule
+    ", $labo_id);
+
+    $rows = $wpdb->get_results($sql, ARRAY_A);
+
+    // Structurer la réponse
+    $effectifs = [];
+    foreach($rows as $r){
+        $effectifs[$r['grade']] = intval($r['total']);
+    }
+
+    return $effectifs;
+}
+
+
+
+
+  /* ===============================
+  *  HELPERS (DB + sanitize + decode)
+  * =============================== */
+
+  function svc_membre_table(){
+    global $wpdb;
+    return $wpdb->prefix . 'recherche_membre';
+  }
+if (!function_exists('svc_membre_common_field_defs')) {
+  function svc_membre_common_field_defs($for_update = false){
+    return array(
+      'user_id'        => array('type'=>'integer', 'required'=>!$for_update),
+      'laboratoire_id' => array('type'=>'integer', 'required'=>!$for_update),
+      'grade'          => array('type'=>'string'),
+      'specialite'     => array('type'=>'string'),
+    );
+  }
+}
+
+  function svc_membre_allowed($for_update = false){
+    // Même structure que les args (type + required)
+    return svc_membre_common_field_defs($for_update);
+  }
+
+  function svc_membre_format($def){
+    return (isset($def['type']) && $def['type'] === 'integer') ? '%d' : '%s';
+  }
+
+  function svc_membre_sanitize($key, $val, $def){
+    if ($val === null) return null;
+    $type = $def['type'] ?? 'string';
+    if ($type === 'integer') return is_numeric($val) ? intval($val) : null;
+    if ($type === 'boolean') return filter_var($val, FILTER_VALIDATE_BOOLEAN) ? 1 : 0;
+    return sanitize_text_field($val);
+  }
+
+  function svc_membre_decode_out($row){
+    if (!$row) return $row;
+    foreach (array('id','user_id','laboratoire_id','user_created') as $k){
+      if (isset($row[$k])) $row[$k] = intval($row[$k]);
+    }
+    return $row;
+  }
+
+  function svc_membre_exists($user_id, $laboratoire_id, $exclude_id = null){
+    global $wpdb; $table = svc_membre_table();
+    if ($exclude_id) {
+      return (int)$wpdb->get_var($wpdb->prepare(
+        "SELECT id FROM $table WHERE user_id=%d AND laboratoire_id=%d AND id<>%d LIMIT 1",
+        $user_id, $laboratoire_id, $exclude_id
+      ));
+    }
+    return (int)$wpdb->get_var($wpdb->prepare(
+      "SELECT id FROM $table WHERE user_id=%d AND laboratoire_id=%d LIMIT 1",
+      $user_id, $laboratoire_id
+    ));
+  }
+
+
+  /* ===============================
+  *  SERVICES (CRUD)
+  * =============================== */
+
+  /*
+  function svc_membre_create(WP_REST_Request $req){
+    global $wpdb;
+    $table   = svc_membre_table();
+    $allowed = svc_membre_allowed(false);
+
+    // Accepte JSON ou x-www-form-urlencoded
+    $data = $req->get_json_params();
+    if (!$data) $data = $req->get_params();
+
+    $row     = array();
+    $formats = array();
+
+    // Champs autorisés (avec validation des requis)
+    foreach ($allowed as $k => $def){
+      $is_required = !empty($def['required']);
+      if (!array_key_exists($k, $data)){
+        if ($is_required) return new WP_Error('missing_param', "Paramètre requis: $k", array('status'=>400));
+        continue;
+      }
+      $val = svc_membre_sanitize($k, $data[$k], $def);
+      if (($val === null || $val === '') && $is_required){
+        return new WP_Error('invalid_param', "Valeur invalide pour: $k", array('status'=>400));
+      }
+      if ($val !== null && $val !== '') { $row[$k] = $val; $formats[] = svc_membre_format($def); }
+    }
+
+    // Contrainte d’unicité (user_id, laboratoire_id)
+    $uid = isset($row['user_id']) ? (int)$row['user_id'] : 0;
+    $lid = isset($row['laboratoire_id']) ? (int)$row['laboratoire_id'] : 0;
+    if ($uid && $lid && svc_membre_exists($uid, $lid)){
+      return new WP_Error('duplicate_member', 'Ce membre est déjà rattaché à ce laboratoire.', array('status'=>409));
+    }
+
+    // Defaults + audit
+    if (empty($row['api']))     { $row['api'] = 'plateforme-recherche/v1'; $formats[] = '%s'; }
+    if (empty($row['service'])) { $row['service'] = 'Espace Labo';         $formats[] = '%s'; }
+    $row['user_created'] = get_current_user_id() ?: null;                  $formats[] = '%d';
+
+    $ok = $wpdb->insert($table, $row, $formats);
+    if (!$ok) {
+      error_log('[svc_membre_create] DB ERROR: '.$wpdb->last_error);
+      return new WP_Error('db_insert_failed', 'Insertion impossible: '.$wpdb->last_error, array('status'=>500));
+    }
+
+    $id  = (int)$wpdb->insert_id;
+    $out = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    return svc_membre_decode_out($out);
+  }
+*/
+
+function svc_membre_create(WP_REST_Request $req){
+    global $wpdb;
+    $table   = svc_membre_table();
+    $allowed = svc_membre_allowed(false);
+
+    // Accepte JSON ou x-www-form-urlencoded
+    $data = $req->get_json_params();
+    if (!$data) $data = $req->get_params();
+
+    $row     = array();
+    $formats = array();
+
+    // Champs autorisés (avec validation des requis)
+    foreach ($allowed as $k => $def){
+        $is_required = !empty($def['required']);
+        if (!array_key_exists($k, $data)){
+            if ($is_required) return new WP_Error('missing_param', "Paramètre requis: $k", array('status'=>400));
+            continue;
+        }
+        $val = svc_membre_sanitize($k, $data[$k], $def);
+        if (($val === null || $val === '') && $is_required){
+            return new WP_Error('invalid_param', "Valeur invalide pour: $k", array('status'=>400));
+        }
+        if ($val !== null && $val !== '') { 
+            $row[$k] = $val; 
+            $formats[] = svc_membre_format($def); 
+        }
+    }
+
+    // Contrainte d’unicité (user_id, laboratoire_id)
+    $uid = isset($row['user_id']) ? (int)$row['user_id'] : 0;
+    $lid = isset($row['laboratoire_id']) ? (int)$row['laboratoire_id'] : 0;
+
+    if ($uid && $lid && svc_membre_exists($uid, $lid)){
+        return new WP_Error('duplicate_member', '⚠️ Ce membre est déjà rattaché à ce laboratoire.', array('status'=>409));
+    }
+
+    // 🚫 Bloquer si l’utilisateur est directeur de labo
+    if ($uid){
+        $user = get_userdata($uid);
+        if ($user && in_array('um_directeur_laboratoire', (array)$user->roles)){
+            return new WP_Error(
+                'forbidden_director',
+                '⚠️ Un directeur de laboratoire ne peut pas être affecté comme membre.',
+                array('status'=>403)
+            );
+        }
+    }
+
+    // Vérification si user déjà affecté à un autre labo
+    if ($uid && $lid){
+        $exists_other = $wpdb->get_var(
+            $wpdb->prepare("SELECT laboratoire_id FROM $table WHERE user_id=%d AND laboratoire_id != %d", $uid, $lid)
+        );
+        if ($exists_other){
+            return new WP_Error(
+                'already_in_other_labo',
+                '⚠️ Cet utilisateur est déjà affecté au laboratoire ID: '.$exists_other.'. Impossible de l’affecter à plusieurs laboratoires.',
+                array('status'=>409)
+            );
+        }
+    }
+
+    // Defaults + audit
+    if (empty($row['api']))     { $row['api'] = 'plateforme-recherche/v1'; $formats[] = '%s'; }
+    if (empty($row['service'])) { $row['service'] = 'Espace Labo';         $formats[] = '%s'; }
+    $row['user_created'] = get_current_user_id() ?: null;                  $formats[] = '%d';
+
+    $ok = $wpdb->insert($table, $row, $formats);
+    if (!$ok) {
+        error_log('[svc_membre_create] DB ERROR: '.$wpdb->last_error);
+        return new WP_Error('db_insert_failed', 'Insertion impossible: '.$wpdb->last_error, array('status'=>500));
+    }
+
+    $id  = (int)$wpdb->insert_id;
+    $out = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+
+// ============================
+    //  Créer une notification
+    // ============================
+    if ($uid && $lid){
+        $labo = $wpdb->get_var($wpdb->prepare(
+            "SELECT intitule FROM {$wpdb->prefix}recherche_laboratoire WHERE id=%d",
+            $lid
+        ));
+
+        if (!function_exists('add_notification')) {
+            function add_notification($user_id, $message, $type = 'affectation'){
+                global $wpdb;
+                $notif_table = $wpdb->prefix . 'recherche_notification';
+                $wpdb->insert($notif_table, [
+                    'user_id'    => intval($user_id),
+                    'message'    => sanitize_text_field($message),
+                    'type'       => sanitize_text_field($type),
+                    'lu'         => 0,
+                    'created_at' => current_time('mysql')
+                ]);
+            }
+        }
+
+        add_notification(
+            $uid,
+            "Vous avez été affecté au laboratoire : $labo",
+            "affectation"
+        );
+    }
+
+    return svc_membre_decode_out($out);
+}
+
+
+
+  function svc_membre_update(WP_REST_Request $req){
+    global $wpdb;
+    $table   = svc_membre_table();
+    $allowed = svc_membre_allowed(true);
+
+    $id = intval($req['id'] ?? 0);
+    if ($id <= 0) return new WP_Error('bad_request','Invalid id', array('status'=>400));
+
+    // Récupération de la ligne courante (pour contrôle d’unicité si user_id/labo changent)
+    $cur = $wpdb->get_row($wpdb->prepare("SELECT user_id,laboratoire_id FROM $table WHERE id=%d", $id), ARRAY_A);
+    if (!$cur) return new WP_Error('not_found','Membre introuvable', array('status'=>404));
+
+    $data = $req->get_params(); // JSON, form-data…
+    $upd     = array();
+    $formats = array();
+
+    foreach ($allowed as $k => $def){
+      if (!array_key_exists($k, $data)) continue;
+      $val = svc_membre_sanitize($k, $data[$k], $def);
+      if ($val === null) continue;
+      $upd[$k]   = $val;
+      $formats[] = svc_membre_format($def);
+    }
+
+    // Contrôle d’unicité si (user_id, laboratoire_id) changent
+    $check_user = array_key_exists('user_id', $upd)        ? (int)$upd['user_id']        : (int)$cur['user_id'];
+    $check_lab  = array_key_exists('laboratoire_id', $upd) ? (int)$upd['laboratoire_id'] : (int)$cur['laboratoire_id'];
+    if ($check_user && $check_lab && svc_membre_exists($check_user, $check_lab, $id)){
+      return new WP_Error('duplicate_member', 'Combinaison (user_id, laboratoire_id) déjà existante.', array('status'=>409));
+    }
+
+    if (empty($upd)) return new WP_Error('bad_request','Aucun champ valide à mettre à jour', array('status'=>400));
+
+    $ok = $wpdb->update($table, $upd, array('id'=>$id), $formats, array('%d'));
+    if ($ok === false) {
+      error_log('[svc_membre_update] DB ERROR: '.$wpdb->last_error);
+      return new WP_Error('db_error', 'Update failed: '.$wpdb->last_error, array('status'=>500));
+    }
+
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    return svc_membre_decode_out($row ?: (array('id'=>$id) + $upd));
+  }
+
+  function svc_membre_delete(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_membre_table(); 
+    $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id), array('%d'));
+    if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+
+  function svc_membre_mine(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_membre_table();
+    $uid   = get_current_user_id();
+    $with_user = filter_var($req->get_param('with_user'), FILTER_VALIDATE_BOOLEAN);
+
+    $select = "m.*";
+    $join   = "";
+    if ($with_user){
+      $select .= ", u.display_name AS user_display_name, u.user_email, um1.meta_value AS first_name, um2.meta_value AS last_name";
+      $join    = " LEFT JOIN {$wpdb->users} u ON m.user_id = u.ID
+                  LEFT JOIN {$wpdb->usermeta} um1 ON (u.ID = um1.user_id AND um1.meta_key = 'first_name')
+                  LEFT JOIN {$wpdb->usermeta} um2 ON (u.ID = um2.user_id AND um2.meta_key = 'last_name')";
+    }
+
+    $where = "WHERE m.user_id = %d";
+    $params = array($uid);
+
+    if ($lid = $req->get_param('laboratoire_id')){
+      $where .= " AND m.laboratoire_id = %d";
+      $params[] = intval($lid);
+    }
+
+    $sql = "SELECT $select FROM $table m $join $where ORDER BY m.id DESC";
+    $rows = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A) ?: array();
+    return array_map('svc_membre_decode_out', $rows);
+  }
+
+  /**
+   * Normalise les rôles entrés par l’API :
+   * - casse/bornage/espaces -> slug
+   * - autorise "chercheur", "doctorant", "student_master" (prefixe um_ ajouté)
+   * - retourne le nom de rôle final tel que stocké dans capabilities
+   */
+  function svc_roles_normalize($role){
+    $r = strtolower(trim((string)$role));
+    $r = str_replace(array(' ', '-'), '_', $r);
+    // si l'utilisateur envoie sans préfixe
+    if (in_array($r, array('chercheur','doctorant','student_master'), true)) {
+      $r = 'um_' . $r;
+    }
+    return $r;
+  }
+
+function svc_membre_get(WP_REST_Request $req){
+  global $wpdb; 
+  $table = svc_membre_table();
+  $id = intval($req['id']);
+
+  $with_user = filter_var($req->get_param('with_user'), FILTER_VALIDATE_BOOLEAN);
+
+  $select = "m.*";
+  $join   = "";
+
+  if ($with_user){
+    $select .= ", u.display_name AS user_display_name, u.user_email";
+    $join   .= " LEFT JOIN {$wpdb->users} u ON m.user_id = u.ID ";
+  }
+
+  // Grade & Spécialité
+  $join .= "
+    LEFT JOIN {$wpdb->usermeta} um_grade 
+      ON (m.user_id = um_grade.user_id AND um_grade.meta_key = 'grade_id')
+    LEFT JOIN {$wpdb->prefix}grade g 
+      ON (CAST(um_grade.meta_value AS UNSIGNED) = g.id)
+    LEFT JOIN {$wpdb->usermeta} um_spec 
+      ON (m.user_id = um_spec.user_id AND um_spec.meta_key = 'specialite_id')
+    LEFT JOIN {$wpdb->prefix}specialites s 
+      ON (CAST(um_spec.meta_value AS UNSIGNED) = s.id)
+  ";
+  $select .= ", g.intitule AS grade, s.intitule AS specialite";
+
+  // CV & état & photo & téléphone
+  $join .= "
+    LEFT JOIN {$wpdb->usermeta} um_cv 
+      ON (m.user_id = um_cv.user_id AND um_cv.meta_key = 'cv_url')
+    LEFT JOIN {$wpdb->usermeta} um_status 
+      ON (m.user_id = um_status.user_id AND um_status.meta_key = 'account_status')
+    LEFT JOIN {$wpdb->usermeta} um_photo
+      ON (m.user_id = um_photo.user_id AND um_photo.meta_key = 'profile_photo')
+    LEFT JOIN {$wpdb->usermeta} um_tel
+      ON (m.user_id = um_tel.user_id AND um_tel.meta_key = 'tel')
+  ";
+  $select .= ",
+    um_cv.meta_value AS cv_url,
+    um_status.meta_value AS account_status,
+    um_photo.meta_value AS profile_photo,
+    um_tel.meta_value AS tel
+  ";
+
+  $sql = "SELECT $select FROM $table m $join WHERE m.id=%d LIMIT 1";
+  $row = $wpdb->get_row($wpdb->prepare($sql, $id), ARRAY_A);
+
+  if (!$row) {
+    return new WP_Error('not_found','Membre introuvable', array('status'=>404));
+  }
+
+  // Fallback si profile_photo vide → Gravatar par défaut
+/* if (empty($row['profile_photo']) && !empty($row['user_email'])) {
+    $row['profile_photo'] = get_avatar_url($row['user_email']);
+  }*/
+
+  $row['profile_photo'] = get_user_meta($row['user_id'], 'avatar_url', true);
+
+  return svc_membre_decode_out($row);
+}
+
+
+/*
+function svc_membre_list(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_membre_table();
+
+    $page = max(1, intval($req->get_param('page') ?: 1));
+    $per  = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+    $off  = ($page - 1) * $per;
+
+    $with_user = filter_var($req->get_param('with_user'), FILTER_VALIDATE_BOOLEAN);
+    $with_etab = filter_var($req->get_param('with_etablissement'), FILTER_VALIDATE_BOOLEAN);
+    $with_proj = filter_var($req->get_param('with_projects'), FILTER_VALIDATE_BOOLEAN);
+
+    // Besoin user?
+    $need_user = $with_user || $req->get_param('search') || (($req->get_param('orderby') ?: '') === 'user');
+
+    // --- Tables projets ---
+    $pm_tab = $wpdb->prefix . 'recherche_projet_membre'; // (id, membre_id, projet_id, role_projet, created_at, updated_at)
+    $p_tab  = $wpdb->prefix . 'recherche_projet';        // (id, titre, ...?)  <-- si différente, adaptez ici
+    $has_pm = svc_table_exists($pm_tab);
+    $has_p  = svc_table_exists($p_tab);
+
+    // Détecter colonne label projet
+    $p_label = 'titre';
+    if ($has_p && !svc_column_exists($p_tab, $p_label)) {
+      $p_label = svc_column_exists($p_tab,'title') ? 'title' : (svc_column_exists($p_tab,'nom') ? 'nom' : null);
+    }
+
+    $select = "m.*";
+    $join   = "";
+    $where  = array();
+    $params = array();
+
+
+    
+
+    if ($need_user){
+      $select .= ", u.display_name AS user_display_name, u.user_email";
+      $join   .= " LEFT JOIN {$wpdb->users} u ON m.user_id = u.ID ";
+    }
+
+    if ($with_etab){
+      $instTable = $wpdb->prefix . 'master_instituts';
+      $join     .= " LEFT JOIN {$wpdb->usermeta} um_inst ON (m.user_id = um_inst.user_id AND um_inst.meta_key = 'institut_id')
+                    LEFT JOIN {$instTable} inst ON (CAST(um_inst.meta_value AS UNSIGNED) = inst.id) ";
+      $select   .= ", CAST(um_inst.meta_value AS UNSIGNED) AS etablissement_id, inst.nom AS etablissement_nom";
+    }
+
+      // ---- Grade et Spécialité via usermeta ----
+      $grade_table = $wpdb->prefix . 'grade';
+      $spec_table  = $wpdb->prefix . 'specialites';
+
+      $join .= "
+        LEFT JOIN {$wpdb->usermeta} um_grade ON (m.user_id = um_grade.user_id AND um_grade.meta_key = 'grade_id')
+        LEFT JOIN {$grade_table} g ON (CAST(um_grade.meta_value AS UNSIGNED) = g.id)
+        LEFT JOIN {$wpdb->usermeta} um_spec ON (m.user_id = um_spec.user_id AND um_spec.meta_key = 'specialite_id')
+        LEFT JOIN {$spec_table} s ON (CAST(um_spec.meta_value AS UNSIGNED) = s.id)
+        LEFT JOIN {$wpdb->usermeta} um_status 
+         ON (m.user_id = um_status.user_id AND um_status.meta_key = 'account_status')
+      ";
+
+      $select .= ",
+        CAST(um_grade.meta_value AS UNSIGNED) AS grade_id, g.intitule AS grade,
+        CAST(um_spec.meta_value AS UNSIGNED) AS specialite_id, s.intitule AS specialite,
+        um_status.meta_value AS account_status
+
+      ";
+
+      // ---- Last activity = dernière connexion ----
+      // suppose meta_key = 'last_login'
+      $join .= "
+        LEFT JOIN {$wpdb->usermeta} um_lastlogin ON (m.user_id = um_lastlogin.user_id AND um_lastlogin.meta_key = 'last_login')
+      ";
+      $select .= ", um_lastlogin.meta_value AS last_activity";
+
+
+    // ------- Projets liés (agrégés) + last_activity -------
+    if ($with_proj && $has_pm){
+      if ($has_p && $p_label){
+        // AGG par membre_id avec noms de projets
+        $agg = "SELECT pm.membre_id,
+                      GROUP_CONCAT(DISTINCT p.`{$p_label}` ORDER BY p.`{$p_label}` SEPARATOR ', ') AS projets_lies,
+                      MAX(pm.updated_at) AS last_proj_update
+                FROM {$pm_tab} pm
+                LEFT JOIN {$p_tab} p ON p.id = pm.projet_id
+                GROUP BY pm.membre_id";
+      } else {
+        // fallback: concat d'IDs
+        $agg = "SELECT pm.membre_id,
+                      GROUP_CONCAT(DISTINCT pm.projet_id ORDER BY pm.projet_id SEPARATOR ', ') AS projets_lies,
+                      MAX(pm.updated_at) AS last_proj_update
+                FROM {$pm_tab} pm
+                GROUP BY pm.membre_id";
+      }
+      $join   .= " LEFT JOIN ( {$agg} ) proj ON proj.membre_id = m.id ";
+      $select .= ", proj.projets_lies,
+                  CASE
+                    WHEN proj.last_proj_update IS NULL THEN m.updated_at
+                    WHEN proj.last_proj_update > m.updated_at THEN proj.last_proj_update
+                    ELSE m.updated_at
+                  END AS last_activity";
+    } else {
+      // Pas de table projets : last_activity = updated_at
+      $select .= ", m.updated_at AS last_activity";
+    }
+
+    // ------- Filtres existants -------
+    if ($lid = $req->get_param('laboratoire_id')){ $where[] = "m.laboratoire_id = %d"; $params[] = intval($lid); }
+    if ($uid = $req->get_param('user_id'))       { $where[] = "m.user_id = %d";       $params[] = intval($uid); }
+    if ($g = trim((string)$req->get_param('grade'))){
+      $where[] = "m.grade LIKE %s"; $params[] = '%' . $wpdb->esc_like($g) . '%';
+    }
+    if ($q = trim((string)$req->get_param('search'))){
+      $qLike = '%' . $wpdb->esc_like($q) . '%';
+      if ($need_user){
+        $where[] = "(m.specialite LIKE %s OR m.grade LIKE %s OR u.display_name LIKE %s OR u.user_email LIKE %s)";
+        array_push($params, $qLike, $qLike, $qLike, $qLike);
+      } else {
+        $where[] = "(m.specialite LIKE %s OR m.grade LIKE %s)";
+        array_push($params, $qLike, $qLike);
+      }
+    }
+    if (filter_var($req->get_param('me'), FILTER_VALIDATE_BOOLEAN)) {
+      $where[] = "m.user_id = %d";
+      $params[] = get_current_user_id();
+    }
+
+    $wsql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
+
+    // ------- TRI -------
+    $orderParam  = strtoupper($req->get_param('order') ?: 'DESC');
+    $order       = in_array($orderParam, array('ASC','DESC'), true) ? $orderParam : 'DESC';
+    $obParam     = $req->get_param('orderby') ?: 'id';
+
+    $obMap = array(
+      'id'            => 'm.id',
+      'created_at'    => 'm.created_at',
+      'updated_at'    => 'm.updated_at',
+      'grade'         => 'm.grade',
+      'specialite'    => 'm.specialite',
+      'user'          => $need_user ? 'u.display_name' : 'm.id',
+      'etablissement' => $with_etab ? 'inst.nom' : 'm.id',
+      'last_activity' => 'last_activity', // <-- nouveau
+    );
+    $orderby = isset($obMap[$obParam]) ? $obMap[$obParam] : 'm.id';
+
+    $sql = "SELECT {$select} FROM {$table} m {$join} {$wsql} ORDER BY {$orderby} {$order} LIMIT %d OFFSET %d";
+    $params[] = $per; $params[] = $off;
+
+    $rows = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A) ?: array();
+    //$rows = array_map('svc_membre_decode_out', $rows);
+
+      // --- Répartition par spécialité ---
+      $spec_table  = $wpdb->prefix . 'specialites';
+      $sql_rep = "
+        SELECT s.intitule AS specialite, COUNT(*) AS total
+        FROM {$table} m
+        LEFT JOIN {$wpdb->usermeta} um_spec 
+          ON (m.user_id = um_spec.user_id AND um_spec.meta_key = 'specialite_id')
+        LEFT JOIN {$spec_table} s 
+          ON (CAST(um_spec.meta_value AS UNSIGNED) = s.id)
+        WHERE 1=1
+      ";
+
+      $params_rep = [];
+      if ($lid = $req->get_param('laboratoire_id')){
+        $sql_rep .= " AND m.laboratoire_id = %d";
+        $params_rep[] = intval($lid);
+      }
+
+      $sql_rep .= " GROUP BY s.intitule";
+
+      $repartition = $wpdb->get_results($wpdb->prepare($sql_rep, ...$params_rep), ARRAY_A) ?: [];
+
+      return [
+        'data' => array_map('svc_membre_decode_out', $rows),
+        'repartition_specialite' => $repartition
+      ];
+}
+*/
+function svc_membre_list(WP_REST_Request $req){
+  global $wpdb; 
+  $table = svc_membre_table();
+
+  $page = max(1, intval($req->get_param('page') ?: 1));
+  $per  = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+  $off  = ($page - 1) * $per;
+
+  $with_user = filter_var($req->get_param('with_user'), FILTER_VALIDATE_BOOLEAN);
+  $with_etab = filter_var($req->get_param('with_etablissement'), FILTER_VALIDATE_BOOLEAN);
+  $with_proj = filter_var($req->get_param('with_projects'), FILTER_VALIDATE_BOOLEAN);
+
+  $need_user = $with_user || $req->get_param('search') || (($req->get_param('orderby') ?: '') === 'user');
+
+  $pm_tab = $wpdb->prefix . 'recherche_projet_membre'; 
+  $p_tab  = $wpdb->prefix . 'recherche_projet';        
+  $has_pm = svc_table_exists($pm_tab);
+  $has_p  = svc_table_exists($p_tab);
+
+  $p_label = 'titre';
+  if ($has_p && !svc_column_exists($p_tab, $p_label)) {
+    $p_label = svc_column_exists($p_tab,'title') ? 'title' : (svc_column_exists($p_tab,'nom') ? 'nom' : null);
+  }
+
+  $select = "m.*";
+  $join   = "";
+  $where  = array();
+  $params = array();
+
+  if ($need_user){
+    $select .= ", u.display_name AS user_display_name, u.user_email, u.ID as user_id";
+    $join   .= " LEFT JOIN {$wpdb->users} u ON m.user_id = u.ID ";
+  }
+
+  if ($with_etab){
+    $instTable = $wpdb->prefix . 'master_instituts';
+    $join     .= " LEFT JOIN {$wpdb->usermeta} um_inst ON (m.user_id = um_inst.user_id AND um_inst.meta_key = 'institut_id')
+                  LEFT JOIN {$instTable} inst ON (CAST(um_inst.meta_value AS UNSIGNED) = inst.id) ";
+    $select   .= ", CAST(um_inst.meta_value AS UNSIGNED) AS etablissement_id, inst.nom AS etablissement_nom";
+  }
+
+  // ---- Grade et Spécialité via usermeta ----
+  $grade_table = $wpdb->prefix . 'grade';
+  $spec_table  = $wpdb->prefix . 'specialites';
+
+  $join .= "
+    LEFT JOIN {$wpdb->usermeta} um_grade ON (m.user_id = um_grade.user_id AND um_grade.meta_key = 'grade_id')
+    LEFT JOIN {$grade_table} g ON (CAST(um_grade.meta_value AS UNSIGNED) = g.id)
+    LEFT JOIN {$wpdb->usermeta} um_spec ON (m.user_id = um_spec.user_id AND um_spec.meta_key = 'specialite_id')
+    LEFT JOIN {$spec_table} s ON (CAST(um_spec.meta_value AS UNSIGNED) = s.id)
+    LEFT JOIN {$wpdb->usermeta} um_status 
+      ON (m.user_id = um_status.user_id AND um_status.meta_key = 'account_status')
+  ";
+
+  $select .= ",
+    CAST(um_grade.meta_value AS UNSIGNED) AS grade_id, g.intitule AS grade,
+    CAST(um_spec.meta_value AS UNSIGNED) AS specialite_id, s.intitule AS specialite,
+    um_status.meta_value AS account_status
+  ";
+
+  $join .= "
+    LEFT JOIN {$wpdb->usermeta} um_lastlogin ON (m.user_id = um_lastlogin.user_id AND um_lastlogin.meta_key = 'last_login')
+  ";
+  $select .= ", um_lastlogin.meta_value AS last_activity";
+
+  // ------- Projets liés -------
+  if ($with_proj && $has_pm){
+    if ($has_p && $p_label){
+      $agg = "SELECT pm.membre_id,
+                    GROUP_CONCAT(DISTINCT p.`{$p_label}` ORDER BY p.`{$p_label}` SEPARATOR ', ') AS projets_lies,
+                    MAX(pm.updated_at) AS last_proj_update
+              FROM {$pm_tab} pm
+              LEFT JOIN {$p_tab} p ON p.id = pm.projet_id
+              GROUP BY pm.membre_id";
+    } else {
+      $agg = "SELECT pm.membre_id,
+                    GROUP_CONCAT(DISTINCT pm.projet_id ORDER BY pm.projet_id SEPARATOR ', ') AS projets_lies,
+                    MAX(pm.updated_at) AS last_proj_update
+              FROM {$pm_tab} pm
+              GROUP BY pm.membre_id";
+    }
+    $join   .= " LEFT JOIN ( {$agg} ) proj ON proj.membre_id = m.id ";
+    $select .= ", proj.projets_lies,
+                CASE
+                  WHEN proj.last_proj_update IS NULL THEN m.updated_at
+                  WHEN proj.last_proj_update > m.updated_at THEN proj.last_proj_update
+                  ELSE m.updated_at
+                END AS last_activity";
+  } else {
+    $select .= ", m.updated_at AS last_activity";
+  }
+
+  // ------- Domaines liés -------
+  $dom_tab = $wpdb->prefix . 'profile_domaines';
+  if (svc_table_exists($dom_tab)) {
+    $aggDom = "
+      SELECT d.user_id,
+             GROUP_CONCAT(DISTINCT d.label ORDER BY d.label SEPARATOR ', ') AS domaines
+      FROM {$dom_tab} d
+      GROUP BY d.user_id
+    ";
+    $join   .= " LEFT JOIN ( {$aggDom} ) dom ON dom.user_id = m.user_id ";
+    $select .= ", dom.domaines";
+  } else {
+    $select .= ", NULL AS domaines";
+  }
+
+  // ------- Filtres -------
+  if ($lid = $req->get_param('laboratoire_id')){ $where[] = "m.laboratoire_id = %d"; $params[] = intval($lid); }
+  if ($uid = $req->get_param('user_id'))       { $where[] = "m.user_id = %d";       $params[] = intval($uid); }
+  if ($g = trim((string)$req->get_param('grade'))){
+    $where[] = "m.grade LIKE %s"; $params[] = '%' . $wpdb->esc_like($g) . '%';
+  }
+  if ($q = trim((string)$req->get_param('search'))){
+    $qLike = '%' . $wpdb->esc_like($q) . '%';
+    if ($need_user){
+      $where[] = "(m.specialite LIKE %s OR m.grade LIKE %s OR u.display_name LIKE %s OR u.user_email LIKE %s)";
+      array_push($params, $qLike, $qLike, $qLike, $qLike);
+    } else {
+      $where[] = "(m.specialite LIKE %s OR m.grade LIKE %s)";
+      array_push($params, $qLike, $qLike);
+    }
+  }
+  if (filter_var($req->get_param('me'), FILTER_VALIDATE_BOOLEAN)) {
+    $where[] = "m.user_id = %d";
+    $params[] = get_current_user_id();
+  }
+
+  $wsql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
+
+  // ------- TRI -------
+  $orderParam  = strtoupper($req->get_param('order') ?: 'DESC');
+  $order       = in_array($orderParam, array('ASC','DESC'), true) ? $orderParam : 'DESC';
+  $obParam     = $req->get_param('orderby') ?: 'id';
+
+  $obMap = array(
+    'id'            => 'm.id',
+    'created_at'    => 'm.created_at',
+    'updated_at'    => 'm.updated_at',
+    'grade'         => 'm.grade',
+    'specialite'    => 'm.specialite',
+    'user'          => $need_user ? 'u.display_name' : 'm.id',
+    'etablissement' => $with_etab ? 'inst.nom' : 'm.id',
+    'last_activity' => 'last_activity',
+  );
+  $orderby = isset($obMap[$obParam]) ? $obMap[$obParam] : 'm.id';
+
+  $sql = "SELECT {$select} FROM {$table} m {$join} {$wsql} ORDER BY {$orderby} {$order} LIMIT %d OFFSET %d";
+  $params[] = $per; $params[] = $off;
+
+  $rows = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A) ?: array();
+
+  foreach ($rows as &$row){
+    if (!empty($row['user_id'])){
+      $row['avatar_url'] = get_user_meta($row['user_id'], 'avatar_url', true);
+    } else {
+      $row['avatar_url'] = null;
+    }
+  }
+
+  // --- Répartition par grade ---
+  $grade_table = $wpdb->prefix . 'grade';
+  $sql_rep = "
+    SELECT COALESCE(g.intitule, 'Non renseigné') AS grade, COUNT(*) AS total
+    FROM {$table} m
+    LEFT JOIN {$wpdb->usermeta} um_grade 
+      ON (m.user_id = um_grade.user_id AND um_grade.meta_key = 'grade_id')
+    LEFT JOIN {$grade_table} g 
+      ON (CAST(um_grade.meta_value AS UNSIGNED) = g.id)
+    WHERE 1=1
+  ";
+  $params_rep = array();
+  if ($lid = $req->get_param('laboratoire_id')) {
+    $sql_rep     .= " AND m.laboratoire_id = %d";
+    $params_rep[] = intval($lid);
+  }
+  $sql_rep .= " GROUP BY g.intitule ORDER BY COUNT(*) DESC";
+  $repartition_grade = $params_rep
+    ? $wpdb->get_results($wpdb->prepare($sql_rep, ...$params_rep), ARRAY_A)
+    : $wpdb->get_results($sql_rep, ARRAY_A);
+
+  // --- Répartition par domaine ---
+  $sql_dom = "
+    SELECT d.label AS domaine, COUNT(DISTINCT d.user_id) AS total
+    FROM {$table} m
+    INNER JOIN {$dom_tab} d ON d.user_id = m.user_id
+    WHERE 1=1
+  ";
+  $params_dom = array();
+  if ($lid = $req->get_param('laboratoire_id')) {
+    $sql_dom     .= " AND m.laboratoire_id = %d";
+    $params_dom[] = intval($lid);
+  }
+  $sql_dom .= " GROUP BY d.label ORDER BY COUNT(*) DESC";
+  $repartition_domaine = $params_dom
+    ? $wpdb->get_results($wpdb->prepare($sql_dom, ...$params_dom), ARRAY_A)
+    : $wpdb->get_results($sql_dom, ARRAY_A);
+
+  // --- Répartition par profil (enseignants / doctorants) ---
+  $profils_table = $wpdb->prefix . 'profils';
+
+  $sql_profil = "
+    SELECT p.id AS profil_id, p.nom AS profil_nom, COUNT(DISTINCT m.user_id) AS total
+    FROM {$table} m
+    INNER JOIN {$wpdb->usermeta} um 
+      ON (m.user_id = um.user_id AND um.meta_key = 'profil_id')
+    INNER JOIN {$profils_table} p 
+      ON (CAST(um.meta_value AS UNSIGNED) = p.id)
+    WHERE 1=1
+  ";
+
+  $params_profil = array();
+  if ($lid = $req->get_param('laboratoire_id')) {
+    $sql_profil .= " AND m.laboratoire_id = %d";
+    $params_profil[] = intval($lid);
+  }
+
+  $sql_profil .= " GROUP BY p.id, p.nom ORDER BY p.id ASC";
+
+  $repartition_profil = $params_profil
+    ? $wpdb->get_results($wpdb->prepare($sql_profil, ...$params_profil), ARRAY_A)
+    : $wpdb->get_results($sql_profil, ARRAY_A);
+
+  $repartition_profil = $repartition_profil ?: [];
+
+
+  // --- Chercheurs par année (via created_at) ---
+  $sql_year = "
+    SELECT YEAR(m.created_at) AS annee, COUNT(*) AS total
+    FROM {$table} m
+    WHERE 1=1
+  ";
+
+  $params_year = [];
+  if ($lid = $req->get_param('laboratoire_id')) {
+    $sql_year .= " AND m.laboratoire_id = %d";
+    $params_year[] = intval($lid);
+  }
+  
+
+  
+
+  $sql_year .= " GROUP BY YEAR(m.created_at) ORDER BY annee ASC";
+
+  $repartition_annee = $params_year
+    ? $wpdb->get_results($wpdb->prepare($sql_year, ...$params_year), ARRAY_A)
+    : $wpdb->get_results($sql_year, ARRAY_A);
+
+  $repartition_annee = $repartition_annee ?: [];
+
+
+  return array(
+    'data'                => array_map('svc_membre_decode_out', $rows),
+    'repartition_grade'   => $repartition_grade ?: [],
+    'repartition_domaine' => $repartition_domaine ?: [],
+    'repartition_profil'  => $repartition_profil ?: [],
+    'repartition_annee'   => $repartition_annee ?: [],
+  );
+}
+
+  // #########################################################
+
+  // === chercheur ===
+  function svc_chercheur_table(){ global $wpdb; return $wpdb->prefix . 'recherche_chercheur'; }
+  function svc_chercheur_allowed(){ return array('email', 'nom', 'prenom', 'grade', 'laboratoire_id', 'orcid', 'photo_url', 'site_web', 'specialite'); }
+
+  function svc_chercheur_list(WP_REST_Request $req){
+    global $wpdb; $table = svc_chercheur_table();
+    $page = max(1, intval($req->get_param('page') ?: 1));
+    $per  = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+    $off  = ($page - 1) * $per;
+    $sql  = $wpdb->prepare("SELECT * FROM $table ORDER BY id DESC LIMIT %d OFFSET %d", $per, $off);
+    return $wpdb->get_results($sql, ARRAY_A);
+  }
+
+  function svc_chercheur_get(WP_REST_Request $req){
+    global $wpdb; $table = svc_chercheur_table(); $id = intval($req['id']);
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    if(!$row) return new WP_Error('not_found','Not found',array('status'=>404));
+    return $row;
+  }
+
+  function svc_chercheur_create(WP_REST_Request $req){
+    global $wpdb; $table = svc_chercheur_table(); $allowed = svc_chercheur_allowed();
+    $data = svc_read_input($req); $ins = array();
+    foreach ($allowed as $k){
+      if(isset($data[$k])){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $ins[$k]=$v;
+      }
+    }
+    if(empty($ins)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->insert($table, $ins); if(!$ok) return new WP_Error('db_error','Insert failed',array('status'=>500));
+    $id = $wpdb->insert_id; return array('id'=>$id) + $ins;
+  }
+
+  function svc_chercheur_update(WP_REST_Request $req){
+    global $wpdb; $table = svc_chercheur_table(); $allowed = svc_chercheur_allowed();
+    $id = intval($req['id']); $data = svc_read_input($req); $upd = array();
+    foreach ($allowed as $k){
+      if(array_key_exists($k,$data)){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $upd[$k]=$v;
+      }
+    }
+    if(empty($upd)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->update($table, $upd, array('id'=>$id)); if($ok===false) return new WP_Error('db_error','Update failed',array('status'=>500));
+    return array('id'=>$id) + $upd;
+  }
+
+  function svc_chercheur_delete(WP_REST_Request $req){
+    global $wpdb; $table = svc_chercheur_table(); $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id)); if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+  // === document ===
+  function svc_document_table(){ global $wpdb; return $wpdb->prefix . 'recherche_document'; }
+  function svc_document_allowed(){ return array('fichier_path', 'titre', 'chercheur_id', 'date_upload', 'type', 'visibility'); }
+
+function svc_document_list(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_document_table();
+
+    $page  = max(1, intval($req->get_param('page') ?: 1));
+    $per   = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+    $off   = ($page - 1) * $per;
+
+    $user   = wp_get_current_user();
+    $roles  = $user->roles;
+    $user_id = get_current_user_id();
+
+    // Cas 1 : Admin ou Service UTM → tous les documents
+    if (in_array('administrator', $roles) || in_array('um_service_utm', $roles)) {
+        $sql = $wpdb->prepare(
+            "SELECT d.*, u.display_name AS chercheur_nom
+             FROM $table d
+             LEFT JOIN {$wpdb->users} u ON d.chercheur_id = u.ID
+             ORDER BY d.id DESC
+             LIMIT %d OFFSET %d",
+            $per, $off
+        );
+    }
+
+    // Cas 2 : Directeur de labo → documents des membres + lui-même
+    elseif (in_array('um_directeur_laboratoire', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}recherche_laboratoire WHERE directeur_user_id = %d",
+            $user_id
+        ));
+        
+        if ($lab_id) {
+            $sql = $wpdb->prepare(
+                "SELECT DISTINCT d.*, u.display_name AS chercheur_nom
+                 FROM $table d
+                 LEFT JOIN {$wpdb->users} u ON d.chercheur_id = u.ID
+
+                 -- Jointure via directeur
+                 LEFT JOIN {$wpdb->prefix}recherche_laboratoire l1 
+                    ON d.chercheur_id = l1.directeur_user_id
+                 
+                 -- Jointure via membre
+                 LEFT JOIN {$wpdb->prefix}recherche_membre m 
+                    ON d.chercheur_id = m.user_id
+                 LEFT JOIN {$wpdb->prefix}recherche_laboratoire l2 
+                    ON l2.id = m.laboratoire_id
+
+                 WHERE (l1.id = %d OR l2.id = %d OR d.chercheur_id = %d)
+                 ORDER BY d.id DESC
+                 LIMIT %d OFFSET %d",
+                $lab_id, $lab_id, $user_id, $per, $off
+            );
+        }
+    }
+
+    // Cas 3 : Chercheur → ses documents + ceux de son labo (directeur inclus)
+    elseif (in_array('um_chercheur', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT laboratoire_id FROM {$wpdb->prefix}recherche_membre WHERE user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $sql = $wpdb->prepare(
+                "SELECT d.*, u.display_name AS chercheur_nom
+                 FROM $table d
+                 LEFT JOIN {$wpdb->users} u ON d.chercheur_id = u.ID
+                 WHERE d.chercheur_id = %d
+                    OR d.chercheur_id IN (
+                        SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                    )
+                    OR d.chercheur_id IN (
+                        SELECT directeur_user_id FROM {$wpdb->prefix}recherche_laboratoire WHERE id = %d
+                    )
+                 ORDER BY d.id DESC
+                 LIMIT %d OFFSET %d",
+                $user_id, $lab_id, $lab_id, $per, $off
+            );
+        } else {
+            // fallback = seulement ses documents
+            $sql = $wpdb->prepare(
+                "SELECT d.*, u.display_name AS chercheur_nom
+                 FROM $table d
+                 LEFT JOIN {$wpdb->users} u ON d.chercheur_id = u.ID
+                 WHERE d.chercheur_id = %d
+                 ORDER BY d.id DESC
+                 LIMIT %d OFFSET %d",
+                $user_id, $per, $off
+            );
+        }
+    }
+
+    // Cas 4 : Autres → seulement leurs documents
+    else {
+        $sql = $wpdb->prepare(
+            "SELECT d.*, u.display_name AS chercheur_nom
+             FROM $table d
+             LEFT JOIN {$wpdb->users} u ON d.chercheur_id = u.ID
+             WHERE d.chercheur_id = %d
+             ORDER BY d.id DESC
+             LIMIT %d OFFSET %d",
+            $user_id, $per, $off
+        );
+    }
+
+    return isset($sql) ? $wpdb->get_results($sql, ARRAY_A) : [];
+}
+
+
+
+/*
+  function svc_document_get(WP_REST_Request $req){
+    global $wpdb; $table = svc_document_table(); $id = intval($req['id']);
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    if(!$row) return new WP_Error('not_found','Not found',array('status'=>404));
+    return $row;
+  }
+    */
+
+  
+/*
+  function svc_document_create(WP_REST_Request $req){
+    global $wpdb; $table = svc_document_table(); $allowed = svc_document_allowed();
+    $data = svc_read_input($req); $ins = array();
+    foreach ($allowed as $k){
+      if(isset($data[$k])){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $ins[$k]=$v;
+      }
+    }
+    if(empty($ins)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->insert($table, $ins); if(!$ok) return new WP_Error('db_error','Insert failed',array('status'=>500));
+    $id = $wpdb->insert_id; return array('id'=>$id) + $ins;
+  }
+*/
+
+
+function svc_document_create(WP_REST_Request $req){
+  global $wpdb; 
+  $table = svc_document_table(); 
+  $allowed = svc_document_allowed();
+
+  $data = $req->get_params();
+  $ins = [];
+
+  foreach ($allowed as $k){
+    if(isset($data[$k])){
+      $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]);
+      $ins[$k] = $v;
+    }
+  }
+
+  // Upload fichier s'il existe
+  if (!empty($_FILES['fichier']['name'])) {
+    require_once(ABSPATH . 'wp-admin/includes/file.php');
+    require_once(ABSPATH . 'wp-admin/includes/media.php');
+    require_once(ABSPATH . 'wp-admin/includes/image.php');
+
+    $attach_id = media_handle_upload('fichier', 0);
+    if (is_wp_error($attach_id)) {
+      return new WP_Error('upload_error', 'Échec upload fichier', ['status'=>500]);
+    }
+    $ins['fichier_path'] = wp_get_attachment_url($attach_id);
+  }
+
+  if (empty($ins['chercheur_id'])) {
+    $ins['chercheur_id'] = get_current_user_id();
+  }
+
+  $ok = $wpdb->insert($table, $ins);
+  if (!$ok) return new WP_Error('db_error','Insert failed',['status'=>500]);
+
+  $id = $wpdb->insert_id;
+  return ['id'=>$id] + $ins;
+}
+
+  function svc_document_update(WP_REST_Request $req){
+    global $wpdb; $table = svc_document_table(); $allowed = svc_document_allowed();
+    $id = intval($req['id']); $data = svc_read_input($req); $upd = array();
+    foreach ($allowed as $k){
+      if(array_key_exists($k,$data)){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $upd[$k]=$v;
+      }
+    }
+    if(empty($upd)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->update($table, $upd, array('id'=>$id)); if($ok===false) return new WP_Error('db_error','Update failed',array('status'=>500));
+    return array('id'=>$id) + $upd;
+  }
+
+  function svc_document_delete(WP_REST_Request $req){
+    global $wpdb; $table = svc_document_table(); $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id)); if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+  // === enseignement ===
+  function svc_enseignement_table(){ global $wpdb; return $wpdb->prefix . 'recherche_enseignement'; }
+  function svc_enseignement_allowed(){ return array('annee_universitaire', 'ue', 'volume_horaire', 'chercheur_id', 'niveau', 'semestre', 'type'); }
+
+  function svc_enseignement_list(WP_REST_Request $req){
+    global $wpdb; $table = svc_enseignement_table();
+    $page = max(1, intval($req->get_param('page') ?: 1));
+    $per  = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+    $off  = ($page - 1) * $per;
+    $sql  = $wpdb->prepare("SELECT * FROM $table ORDER BY id DESC LIMIT %d OFFSET %d", $per, $off);
+    return $wpdb->get_results($sql, ARRAY_A);
+  }
+
+  function svc_enseignement_get(WP_REST_Request $req){
+    global $wpdb; $table = svc_enseignement_table(); $id = intval($req['id']);
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    if(!$row) return new WP_Error('not_found','Not found',array('status'=>404));
+    return $row;
+  }
+
+  function svc_enseignement_create(WP_REST_Request $req){
+    global $wpdb; $table = svc_enseignement_table(); $allowed = svc_enseignement_allowed();
+    $data = svc_read_input($req); $ins = array();
+    foreach ($allowed as $k){
+      if(isset($data[$k])){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $ins[$k]=$v;
+      }
+    }
+    if(empty($ins)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->insert($table, $ins); if(!$ok) return new WP_Error('db_error','Insert failed',array('status'=>500));
+    $id = $wpdb->insert_id; return array('id'=>$id) + $ins;
+  }
+
+  function svc_enseignement_update(WP_REST_Request $req){
+    global $wpdb; $table = svc_enseignement_table(); $allowed = svc_enseignement_allowed();
+    $id = intval($req['id']); $data = svc_read_input($req); $upd = array();
+    foreach ($allowed as $k){
+      if(array_key_exists($k,$data)){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $upd[$k]=$v;
+      }
+    }
+    if(empty($upd)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->update($table, $upd, array('id'=>$id)); if($ok===false) return new WP_Error('db_error','Update failed',array('status'=>500));
+    return array('id'=>$id) + $upd;
+  }
+
+  function svc_enseignement_delete(WP_REST_Request $req){
+    global $wpdb; $table = svc_enseignement_table(); $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id)); if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+function svc_is_directeur(){
+  $u = wp_get_current_user(); return in_array('um_directeur_laboratoire', (array)$u->roles, true);
+}
+function svc_is_chercheur(){
+  $u = wp_get_current_user(); return in_array('um_chercheur', (array)$u->roles, true);
+}
+function svc_directeur_lab_id($user_id){
+  global $wpdb;
+  $t_lab = $wpdb->prefix . 'recherche_laboratoire';
+  return (int) $wpdb->get_var( $wpdb->prepare("SELECT id FROM {$t_lab} WHERE directeur_user_id=%d", $user_id) );
+}
+function svc_user_lab_id($user_id){
+  global $wpdb;
+  $t_mem = $wpdb->prefix . 'recherche_membre';
+  return (int) $wpdb->get_var( $wpdb->prepare("SELECT laboratoire_id FROM {$t_mem} WHERE user_id=%d", $user_id) );
+}
+
+
+  // === manifestation ===
+  function svc_manifestation_table(){ global $wpdb; return $wpdb->prefix . 'recherche_manifestation'; }
+
+  function svc_manifestation_list(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_manifestation_table(); // utm_recherche_manifestation
+    $tc    = svc_manifestation_categorie_table(); // utm_recherche_manifestation_categorie
+
+    $page = max(1, intval($req->get_param('page') ?: 1));
+    $per  = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+    $off  = ($page - 1) * $per;
+
+    $sql  = $wpdb->prepare("
+        SELECT m.*,
+               c.nom AS categorie
+        FROM $table m
+        LEFT JOIN $tc c ON m.categorie_id = c.id
+        ORDER BY m.id DESC
+        LIMIT %d OFFSET %d
+    ", $per, $off);
+
+    return $wpdb->get_results($sql, ARRAY_A);
+}
+
+
+  function svc_manifestation_get(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_manifestation_table();               // table des manifestations
+    $tc    = svc_manifestation_categorie_table();     // table des catégories
+
+    $id = intval($req['id']);
+
+    $sql = $wpdb->prepare("
+        SELECT m.*, 
+               c.nom AS categorie, 
+               c.description AS categorie_description
+        FROM $table m
+        LEFT JOIN $tc c ON m.categorie_id = c.id
+        WHERE m.id = %d
+    ", $id);
+
+    $row = $wpdb->get_row($sql, ARRAY_A);
+
+    if(!$row) {
+        return new WP_Error('not_found','Not found',array('status'=>404));
+    }
+
+    return $row;
+}
+
+
+  function svc_manifestation_delete(WP_REST_Request $req){
+    global $wpdb; $table = svc_manifestation_table(); $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id)); if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+  // === notification ===
+  function svc_notification_table(){ global $wpdb; return $wpdb->prefix . 'recherche_notification'; }
+  function svc_notification_allowed(){ return array('lu', 'chercheur_id'); }
+/*
+  function svc_notification_list(WP_REST_Request $req){
+    global $wpdb; $table = svc_notification_table();
+    $page = max(1, intval($req->get_param('page') ?: 1));
+    $per  = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+    $off  = ($page - 1) * $per;
+    $sql  = $wpdb->prepare("SELECT * FROM $table ORDER BY id DESC LIMIT %d OFFSET %d", $per, $off);
+    return $wpdb->get_results($sql, ARRAY_A);
+  }
+*/
+  function svc_notification_get(WP_REST_Request $req){
+    global $wpdb; $table = svc_notification_table(); $id = intval($req['id']);
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    if(!$row) return new WP_Error('not_found','Not found',array('status'=>404));
+    return $row;
+  }
+
+  function svc_notification_create(WP_REST_Request $req){
+    global $wpdb; $table = svc_notification_table(); $allowed = svc_notification_allowed();
+    $data = svc_read_input($req); $ins = array();
+    foreach ($allowed as $k){
+      if(isset($data[$k])){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $ins[$k]=$v;
+      }
+    }
+    if(empty($ins)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->insert($table, $ins); if(!$ok) return new WP_Error('db_error','Insert failed',array('status'=>500));
+    $id = $wpdb->insert_id; return array('id'=>$id) + $ins;
+  }
+
+  function svc_notification_update(WP_REST_Request $req){
+    global $wpdb; $table = svc_notification_table(); $allowed = svc_notification_allowed();
+    $id = intval($req['id']); $data = svc_read_input($req); $upd = array();
+    foreach ($allowed as $k){
+      if(array_key_exists($k,$data)){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $upd[$k]=$v;
+      }
+    }
+    if(empty($upd)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->update($table, $upd, array('id'=>$id)); if($ok===false) return new WP_Error('db_error','Update failed',array('status'=>500));
+    return array('id'=>$id) + $upd;
+  }
+
+  function svc_notification_delete(WP_REST_Request $req){
+    global $wpdb; $table = svc_notification_table(); $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id)); if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+  // === projet ===
+  function svc_projet_table(){ global $wpdb; return $wpdb->prefix . 'recherche_projet'; }
+  function svc_projet_allowed(){ return array('date_debut', 'titre', 'type_projet_id', 'budget', 'chercheur_id', 'date_fin', 'resume', 'statut', 'type_financement','objectifs'); }
+
+function svc_projet_list(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_projet_table();
+    $page  = max(1, intval($req->get_param('page') ?: 1));
+    $per   = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+    $off   = ($page - 1) * $per;
+
+    $user   = wp_get_current_user();
+    $roles  = $user->roles;
+    $user_id = get_current_user_id();
+
+    // Cas 1 : Admin ou Service UTM → tous les projets
+    if (in_array('administrator', $roles) || in_array('um_service_utm', $roles)) {
+        $sql = $wpdb->prepare(
+            "SELECT p.*, u.display_name AS chercheur_nom
+             FROM $table p
+             LEFT JOIN {$wpdb->users} u ON p.chercheur_id = u.ID
+             ORDER BY p.id DESC
+             LIMIT %d OFFSET %d",
+            $per, $off
+        );
+    }
+
+    // Cas 2 : Directeur de thèse → projets des membres de son labo
+    elseif (in_array('um_directeur_laboratoire', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}recherche_laboratoire WHERE directeur_user_id = %d",
+            $user_id
+        ));
+        
+       if ($lab_id) {
+          $sql = $wpdb->prepare(
+              "SELECT DISTINCT p.*, u.display_name AS chercheur_nom
+              FROM $table p
+              LEFT JOIN {$wpdb->users} u ON p.chercheur_id = u.ID
+              
+              -- Jointure via directeur
+              LEFT JOIN {$wpdb->prefix}recherche_laboratoire l1 
+                  ON p.chercheur_id = l1.directeur_user_id
+              
+              -- Jointure via membre
+              LEFT JOIN {$wpdb->prefix}recherche_membre m 
+                  ON p.chercheur_id = m.user_id
+              LEFT JOIN {$wpdb->prefix}recherche_laboratoire l2 
+                  ON l2.id = m.laboratoire_id
+              
+              WHERE (l1.id = %d OR l2.id = %d OR p.chercheur_id = %d)
+              ORDER BY p.id DESC
+              LIMIT %d OFFSET %d",
+              $lab_id, $lab_id, $user_id, $per, $off
+          );
+      }
+
+
+      
+    }
+
+    // Cas 3 : Chercheur → ses projets + ceux de son labo
+    elseif (in_array('um_chercheur', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT laboratoire_id FROM {$wpdb->prefix}recherche_membre WHERE user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $sql = $wpdb->prepare(
+                "SELECT p.*, u.display_name AS chercheur_nom
+                 FROM $table p
+                 LEFT JOIN {$wpdb->users} u ON p.chercheur_id = u.ID
+                 WHERE p.chercheur_id = %d
+                    OR p.chercheur_id IN (
+                        SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                    )
+                    OR p.chercheur_id IN (
+                        SELECT directeur_user_id  FROM utm_recherche_laboratoire WHERE id = %d
+                    )
+                 ORDER BY p.id DESC
+                 LIMIT %d OFFSET %d",
+                $user_id, $lab_id,$lab_id, $per, $off
+            );
+
+          
+        } else {
+            // fallback = seulement ses projets
+            $sql = $wpdb->prepare(
+                "SELECT p.*, u.display_name AS chercheur_nom
+                 FROM $table p
+                 LEFT JOIN {$wpdb->users} u ON p.chercheur_id = u.ID
+                 WHERE p.chercheur_id = %d
+                 ORDER BY p.id DESC
+                 LIMIT %d OFFSET %d",
+                $user_id, $per, $off
+            );
+        }
+    }
+
+    // Cas 4 : Autres → ses propres projets
+    else {
+        $sql = $wpdb->prepare(
+            "SELECT p.*, u.display_name AS chercheur_nom
+             FROM $table p
+             LEFT JOIN {$wpdb->users} u ON p.chercheur_id = u.ID
+             WHERE p.chercheur_id = %d
+             ORDER BY p.id DESC
+             LIMIT %d OFFSET %d",
+            $user_id, $per, $off
+        );
+    }
+
+
+
+    return isset($sql) ? $wpdb->get_results($sql, ARRAY_A) : [];
+}
+
+
+  function svc_projet_get(WP_REST_Request $req){
+    global $wpdb; $table = svc_projet_table(); $id = intval($req['id']);
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    if(!$row) return new WP_Error('not_found','Not found',array('status'=>404));
+    return $row;
+  }
+
+  /*
+    function svc_projet_create(WP_REST_Request $req){
+      global $wpdb; $table = svc_projet_table(); $allowed = svc_projet_allowed();
+      $data = svc_read_input($req); $ins = array();
+      foreach ($allowed as $k){
+        if(isset($data[$k])){
+          if ($k === 'email') { $v = sanitize_email($data[$k]); }
+          else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+          $ins[$k]=$v;
+        }
+      }
+      if(empty($ins)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+      $ok = $wpdb->insert($table, $ins); if(!$ok) return new WP_Error('db_error','Insert failed',array('status'=>500));
+      $id = $wpdb->insert_id; return array('id'=>$id) + $ins;
+    }
+
+    function svc_projet_update(WP_REST_Request $req){
+      global $wpdb; $table = svc_projet_table(); $allowed = svc_projet_allowed();
+      $id = intval($req['id']); $data = svc_read_input($req); $upd = array();
+      foreach ($allowed as $k){
+        if(array_key_exists($k,$data)){
+          if ($k === 'email') { $v = sanitize_email($data[$k]); }
+          else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+          $upd[$k]=$v;
+        }
+      }
+      if(empty($upd)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+      $ok = $wpdb->update($table, $upd, array('id'=>$id)); if($ok===false) return new WP_Error('db_error','Update failed',array('status'=>500));
+      return array('id'=>$id) + $upd;
+    }
+  */
+
+function svc_projet_handle_file($file, $prefix = '') {
+    if (empty($file['name'])) return null;
+
+    $upload_dir = WP_CONTENT_DIR . '/recherche/projet/';
+    if (!file_exists($upload_dir)) {
+        wp_mkdir_p($upload_dir);
+    }
+
+    // sécuriser le nom
+    $ext = pathinfo($file['name'], PATHINFO_EXTENSION);
+    $safe_name = sanitize_file_name(($prefix ?: 'file') . '-' . time() . '.' . $ext);
+
+    $target = $upload_dir . $safe_name;
+    if (move_uploaded_file($file['tmp_name'], $target)) {
+        // Retourne chemin relatif (ou URL complète)
+        return '/wp-content/recherche/projet/' . $safe_name;
+    }
+    return null;
+}
+/*
+function svc_projet_create(WP_REST_Request $req) {
+    global $wpdb; 
+    $table   = svc_projet_table(); 
+    $allowed = svc_projet_allowed();
+    $data    = svc_read_input($req);
+    $ins     = [];
+
+    foreach ($allowed as $k){
+        if(isset($data[$k])){
+            $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]);
+            $ins[$k] = $v;
+        }
+    }
+
+    // --- gestion upload fichiers ---
+    if (!empty($_FILES['budget_piece'])) {
+        $path = svc_projet_handle_file($_FILES['budget_piece'], 'budget');
+        if ($path) $ins['budget_piece'] = $path;
+    }
+    if (!empty($_FILES['convention_piece'])) {
+        $path = svc_projet_handle_file($_FILES['convention_piece'], 'convention');
+        if ($path) $ins['convention_piece'] = $path;
+    }
+
+    if (empty($ins)) 
+        return new WP_Error('bad_request','No valid fields',['status'=>400]);
+
+    $ok = $wpdb->insert($table, $ins);
+    if (!$ok) return new WP_Error('db_error','Insert failed',['status'=>500]);
+
+    $id = $wpdb->insert_id;
+    return ['id'=>$id] + $ins;
+}
+    */
+function svc_projet_create(WP_REST_Request $req) {
+    global $wpdb; 
+    $table   = svc_projet_table(); 
+    $allowed = svc_projet_allowed();
+    $data    = svc_read_input($req);
+    $ins     = [];
+
+    foreach ($allowed as $k) {
+        if (isset($data[$k])) {
+            $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]);
+            $ins[$k] = $v;
+        }
+    }
+
+    // 🔹 Ajout automatique du chercheur connecté
+    $user_id = get_current_user_id();
+    if ($user_id) {
+        $ins['chercheur_id'] = intval($user_id);
+    }
+
+    // --- gestion upload fichiers ---
+    if (!empty($_FILES['budget_piece'])) {
+        $path = svc_projet_handle_file($_FILES['budget_piece'], 'budget');
+        if ($path) $ins['budget_piece'] = $path;
+    }
+    if (!empty($_FILES['convention_piece'])) {
+        $path = svc_projet_handle_file($_FILES['convention_piece'], 'convention');
+        if ($path) $ins['convention_piece'] = $path;
+    }
+
+    if (empty($ins)) {
+        return new WP_Error('bad_request','No valid fields',['status'=>400]);
+    }
+
+    $ok = $wpdb->insert($table, $ins);
+    if (!$ok) {
+        return new WP_Error('db_error','Insert failed',['status'=>500]);
+    }
+
+    $id = $wpdb->insert_id;
+    return ['id'=>$id] + $ins;
+}
+
+
+function svc_projet_update(WP_REST_Request $req){
+    global $wpdb; 
+    $table   = svc_projet_table(); 
+    $allowed = svc_projet_allowed();
+    $id      = intval($req['id']); 
+    $data    = svc_read_input($req);
+    $upd     = [];
+
+   /* foreach ($allowed as $k){
+        if(array_key_exists($k,$data)){
+            $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]);
+            $upd[$k] = $v;
+        }
+    }*/
+
+    foreach ($allowed as $k){
+        if (array_key_exists($k, $data)){
+            $v = $data[$k];
+            if (is_array($v)) {
+                $v = reset($v); // ne prend que la première valeur
+            }
+
+            if ($k === 'budget') {
+                $v = floatval($v); // forcer budget en float
+            } elseif (in_array($k, ['date_debut','date_fin'])) {
+                $v = sanitize_text_field($v); // dates
+            } else {
+                $v = is_scalar($v) ? sanitize_text_field($v) : wp_json_encode($v);
+            }
+
+            $upd[$k] = $v;
+        }
+    }
+
+
+    // --- upload fichiers ---
+    if (!empty($_FILES['budget_piece'])) {
+        $path = svc_projet_handle_file($_FILES['budget_piece'], 'budget');
+        if ($path) $upd['budget_piece'] = $path;
+    }
+    if (!empty($_FILES['convention_piece'])) {
+        $path = svc_projet_handle_file($_FILES['convention_piece'], 'convention');
+        if ($path) $upd['convention_piece'] = $path;
+    }
+
+    if (empty($upd)) 
+        return new WP_Error('bad_request','No valid fields',['status'=>400]);
+
+    $ok = $wpdb->update($table, $upd, ['id'=>$id]);
+    if ($ok === false) return new WP_Error('db_error','Update failed',['status'=>500]);
+
+    return ['id'=>$id] + $upd;
+}
+
+  function svc_projet_delete(WP_REST_Request $req){
+    global $wpdb; $table = svc_projet_table(); $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id)); if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+function svc_projet_stats(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_projet_table();
+    $user   = wp_get_current_user();
+    $roles  = $user->roles;
+    $user_id = get_current_user_id();
+
+    $total = 0;
+    $financement = 0;
+    $repartition = [];
+
+    // Cas 1 : Admin ou Service UTM → toutes les stats
+    if (in_array('administrator', $roles) || in_array('um_service_utm', $roles)) {
+        $total       = $wpdb->get_var("SELECT COUNT(*) FROM $table");
+        $financement = $wpdb->get_var("SELECT SUM(budget) FROM $table");
+        $repartition = $wpdb->get_results("SELECT statut, COUNT(*) as nb FROM $table GROUP BY statut", ARRAY_A);
+    }
+
+    // Cas 2 : Directeur de laboratoire → stats des projets des membres de son labo
+    elseif (in_array('um_directeur_laboratoire', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}recherche_laboratoire WHERE directeur_user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $total = $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) 
+                 FROM $table p
+                 LEFT JOIN {$wpdb->prefix}recherche_membre m ON p.chercheur_id = m.user_id
+                 WHERE m.laboratoire_id = %d OR p.chercheur_id = %d",
+                $lab_id, $user_id
+            ));
+            $financement = $wpdb->get_var($wpdb->prepare(
+                "SELECT SUM(budget) 
+                 FROM $table p
+                 LEFT JOIN {$wpdb->prefix}recherche_membre m ON p.chercheur_id = m.user_id
+                 WHERE m.laboratoire_id = %d OR p.chercheur_id = %d",
+                $lab_id, $user_id
+            ));
+            $repartition = $wpdb->get_results($wpdb->prepare(
+                "SELECT p.statut, COUNT(*) as nb 
+                 FROM $table p
+                 LEFT JOIN {$wpdb->prefix}recherche_membre m ON p.chercheur_id = m.user_id
+                 WHERE m.laboratoire_id = %d OR p.chercheur_id = %d
+                 GROUP BY p.statut",
+                $lab_id, $user_id
+            ), ARRAY_A);
+        }
+    }
+
+    // Cas 3 : Chercheur → ses projets + ceux de son labo + ceux de son directeur
+    elseif (in_array('um_chercheur', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT laboratoire_id FROM {$wpdb->prefix}recherche_membre WHERE user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $total = $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) 
+                 FROM $table p
+                 WHERE p.chercheur_id = %d
+                    OR p.chercheur_id IN (SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d)
+                    OR p.chercheur_id IN (SELECT directeur_user_id FROM {$wpdb->prefix}recherche_laboratoire WHERE id = %d)",
+                $user_id, $lab_id, $lab_id
+            ));
+            $financement = $wpdb->get_var($wpdb->prepare(
+                "SELECT SUM(budget) 
+                 FROM $table p
+                 WHERE p.chercheur_id = %d
+                    OR p.chercheur_id IN (SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d)
+                    OR p.chercheur_id IN (SELECT directeur_user_id FROM {$wpdb->prefix}recherche_laboratoire WHERE id = %d)",
+                $user_id, $lab_id, $lab_id
+            ));
+            $repartition = $wpdb->get_results($wpdb->prepare(
+                "SELECT p.statut, COUNT(*) as nb 
+                 FROM $table p
+                 WHERE p.chercheur_id = %d
+                    OR p.chercheur_id IN (SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d)
+                    OR p.chercheur_id IN (SELECT directeur_user_id FROM {$wpdb->prefix}recherche_laboratoire WHERE id = %d)
+                 GROUP BY p.statut",
+                $user_id, $lab_id, $lab_id
+            ), ARRAY_A);
+        } else {
+            // fallback = seulement ses projets
+            $total = $wpdb->get_var($wpdb->prepare(
+                "SELECT COUNT(*) FROM $table WHERE chercheur_id = %d", $user_id
+            ));
+            $financement = $wpdb->get_var($wpdb->prepare(
+                "SELECT SUM(budget) FROM $table WHERE chercheur_id = %d", $user_id
+            ));
+            $repartition = $wpdb->get_results($wpdb->prepare(
+                "SELECT statut, COUNT(*) as nb FROM $table WHERE chercheur_id = %d GROUP BY statut",
+                $user_id
+            ), ARRAY_A);
+        }
+    }
+
+    // Cas 4 : Autres → seulement ses projets
+    else {
+        $total = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM $table WHERE chercheur_id = %d", $user_id
+        ));
+        $financement = $wpdb->get_var($wpdb->prepare(
+            "SELECT SUM(budget) FROM $table WHERE chercheur_id = %d", $user_id
+        ));
+        $repartition = $wpdb->get_results($wpdb->prepare(
+            "SELECT statut, COUNT(*) as nb FROM $table WHERE chercheur_id = %d GROUP BY statut",
+            $user_id
+        ), ARRAY_A);
+    }
+
+    return array(
+        'total'       => intval($total),
+        'financement' => floatval($financement),
+        'repartition' => $repartition
+    );
+}
+
+
+
+
+// === source_financement ===
+function svc_source_financement_table(){ 
+    global $wpdb; 
+    return $wpdb->prefix . 'recherche_source_financement'; 
+}
+
+/**
+ * Liste des sources de financement actives
+ */
+function svc_source_financement_list(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_source_financement_table();
+
+    $sql = "SELECT id, code, intitule, intitule_ar, type 
+            FROM $table 
+            WHERE actif=1 
+            ORDER BY intitule ASC";
+    return $wpdb->get_results($sql, ARRAY_A);
+}
+
+// === type_projet ===
+function svc_type_projet_table(){ 
+    global $wpdb; 
+    return $wpdb->prefix . 'recherche_type_projet'; // table : utm_recherche_type_projet
+}
+
+/**
+ * Liste des types de projets actifs
+ */
+function svc_type_projet_list(WP_REST_Request $req){
+    global $wpdb; 
+    $table = svc_type_projet_table();
+
+    $sql = "SELECT id, code, intitule, intitule_ar 
+            FROM $table 
+            WHERE actif=1 
+            ORDER BY intitule ASC";
+    return $wpdb->get_results($sql, ARRAY_A);
+}
+
+
+
+
+// ======= projet_membre ===
+  function svc_projet_membre_table(){ global $wpdb; return $wpdb->prefix . 'recherche_projet_membre'; }
+  function svc_projet_membre_allowed(){ return array('chercheur_id', 'projet_id', 'role_projet'); }
+
+  function svc_projet_membre_list(WP_REST_Request $req){
+    global $wpdb; $table = svc_projet_membre_table();
+    $page = max(1, intval($req->get_param('page') ?: 1));
+    $per  = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+    $off  = ($page - 1) * $per;
+    $sql  = $wpdb->prepare("SELECT * FROM $table ORDER BY id DESC LIMIT %d OFFSET %d", $per, $off);
+    return $wpdb->get_results($sql, ARRAY_A);
+  }
+
+  function svc_projet_membre_get(WP_REST_Request $req){
+    global $wpdb; $table = svc_projet_membre_table(); $id = intval($req['id']);
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    if(!$row) return new WP_Error('not_found','Not found',array('status'=>404));
+    return $row;
+  }
+
+  function svc_projet_membre_create(WP_REST_Request $req){
+    global $wpdb; $table = svc_projet_membre_table(); $allowed = svc_projet_membre_allowed();
+    $data = svc_read_input($req); $ins = array();
+    foreach ($allowed as $k){
+      if(isset($data[$k])){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $ins[$k]=$v;
+      }
+    }
+
+    if(empty($ins)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->insert($table, $ins); if(!$ok) return new WP_Error('db_error','Insert failed',array('status'=>500));
+    $id = $wpdb->insert_id; return array('id'=>$id) + $ins;
+  }
+
+  function svc_projet_membre_update(WP_REST_Request $req){
+    global $wpdb; $table = svc_projet_membre_table(); $allowed = svc_projet_membre_allowed();
+    $id = intval($req['id']); $data = svc_read_input($req); $upd = array();
+    foreach ($allowed as $k){
+      if(array_key_exists($k,$data)){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $upd[$k]=$v;
+      }
+    }
+    if(empty($upd)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->update($table, $upd, array('id'=>$id)); if($ok===false) return new WP_Error('db_error','Update failed',array('status'=>500));
+    return array('id'=>$id) + $upd;
+  }
+
+  function svc_projet_membre_delete(WP_REST_Request $req){
+    global $wpdb; $table = svc_projet_membre_table(); $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id)); if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+
+  /**
+   * Liste des comptes UTILISATEURS depuis utm_users + utm_user_meta
+   * Filtres : roles[], etablissement_id (meta institut_id), search, exclude_lab
+   * GET /wp-json/plateforme-recherche/v1/users
+   */function svc_users_list(WP_REST_Request $req){
+  global $wpdb;
+
+  $users_table = $wpdb->prefix . 'users';
+  $umeta_table = $wpdb->prefix . 'usermeta';
+  $inst_table  = $wpdb->prefix . 'master_instituts';
+  $membre_tab  = $wpdb->prefix . 'recherche_membre';
+
+  $page = max(1, (int)($req->get_param('page') ?: 1));
+  $per  = min(200, max(1, (int)($req->get_param('per_page') ?: 50)));
+  $off  = ($page - 1) * $per;
+
+  $search     = trim((string)$req->get_param('search'));
+  $instId     = (int)($req->get_param('etablissement_id') ?: $req->get_param('institut_id') ?: 0);
+  $withEtab   = filter_var($req->get_param('with_etablissement'), FILTER_VALIDATE_BOOLEAN);
+  $excludeLab = (int)($req->get_param('exclude_lab') ?: 0);
+
+  // ✅ Nouveau: ne retourner que les utilisateurs non affectés à AUCUN labo
+  $onlyFree   = filter_var($req->get_param('only_free'), FILTER_VALIDATE_BOOLEAN)
+             || (int)$req->get_param('exclude_any_lab') === 1;
+
+  $rolesParam = $req->get_param('roles');
+  if ($rolesParam && !is_array($rolesParam)) {
+    $rolesParam = preg_split('/[,\s]+/', (string)$rolesParam);
+  }
+  $roles    = array_values(array_filter(array_unique(array_map('svc_roles_normalize', (array)$rolesParam))));
+  $needRole = !empty($roles) || (($req->get_param('orderby') ?: '') === 'role');
+
+  $needInst = $instId || $withEtab || (($req->get_param('orderby') ?: '') === 'etablissement');
+  $cap_key  = $wpdb->get_blog_prefix() . 'capabilities';
+
+  $select = "u.ID as id, u.user_login, u.user_email, u.display_name, u.user_registered";
+  $join   = "";
+
+  if ($needRole) {
+    $join .= $wpdb->prepare(
+      " LEFT JOIN {$umeta_table} um_role
+          ON (u.ID = um_role.user_id AND (um_role.meta_key = 'role' OR um_role.meta_key = 'roles' OR um_role.meta_key = 'capabilities' OR um_role.meta_key = %s)) ",
+      $cap_key
+    );
+  }
+
+  if ($needInst) {
+    $join .= " LEFT JOIN {$umeta_table} um_inst
+                ON (u.ID = um_inst.user_id AND um_inst.meta_key = 'institut_id')
+              LEFT JOIN {$inst_table} inst
+                ON (CAST(um_inst.meta_value AS UNSIGNED) = inst.id) ";
+    if ($withEtab) {
+      $select .= ", CAST(um_inst.meta_value AS UNSIGNED) AS etablissement_id, inst.nom AS etablissement_nom";
+    }
+  }
+
+  // Exclure les comptes déjà membres de CE labo (ancien comportement)
+  if ($excludeLab) {
+    $join .= $wpdb->prepare(
+      " LEFT JOIN {$membre_tab} m_ex ON (m_ex.user_id = u.ID AND m_ex.laboratoire_id = %d) ",
+      $excludeLab
+    );
+  }
+
+  // ✅ Nouveau: JOIN générique pour tester l’affectation à n’importe quel labo
+  if ($onlyFree) {
+    $join .= " LEFT JOIN {$membre_tab} m_any ON (m_any.user_id = u.ID) ";
+  }
+
+  $where  = array();
+  $params = array();
+
+  if ($search !== '') {
+    $like = '%' . $wpdb->esc_like($search) . '%';
+    $where[] = "(u.display_name LIKE %s OR u.user_email LIKE %s OR u.user_login LIKE %s)";
+    array_push($params, $like, $like, $like);
+  }
+
+  if (!empty($roles)) {
+    $roleClauses = array();
+    foreach ($roles as $r) {
+      $roleClauses[] = "um_role.meta_value LIKE %s";
+      $params[] = '%'.$wpdb->esc_like($r).'%';
+    }
+    $where[] = '(' . implode(' OR ', $roleClauses) . ')';
+  }
+
+  if ($instId) {
+    $where[] = "CAST(um_inst.meta_value AS UNSIGNED) = %d";
+    $params[] = $instId;
+  }
+
+  if ($excludeLab) {
+    $where[] = "m_ex.id IS NULL";
+  }
+
+  // ✅ Nouveau: n’afficher que les utilisateurs qui ne sont affectés à aucun labo
+  if ($onlyFree) {
+    $where[] = "m_any.id IS NULL";
+  }
+
+  $wsql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
+
+  $order   = strtoupper($req->get_param('order') ?: 'ASC');
+  if (!in_array($order, array('ASC','DESC'), true)) $order = 'ASC';
+  $obParam = $req->get_param('orderby') ?: 'display_name';
+  $obMap   = array(
+    'id'            => 'u.ID',
+    'display_name'  => 'u.display_name',
+    'email'         => 'u.user_email',
+    'registered'    => 'u.user_registered',
+    'etablissement' => $needInst ? 'inst.nom' : 'u.display_name',
+  );
+  $orderby = isset($obMap[$obParam]) ? $obMap[$obParam] : 'u.display_name';
+
+  $sql = "SELECT {$select}
+          FROM {$users_table} u
+          {$join}
+          {$wsql}
+          ORDER BY {$orderby} {$order}
+          LIMIT %d OFFSET %d";
+
+  $params[] = $per; $params[] = $off;
+
+  $rows = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A) ?: array();
+
+  foreach ($rows as &$r) {
+    $r['id'] = (int)$r['id'];
+    if (isset($r['etablissement_id'])) $r['etablissement_id'] = (int)$r['etablissement_id'];
+  }
+
+  return $rows;
+}
+
+
+  // ---------- Helpers schéma DB (si déjà définis, laisser tels quels) ----------
+  if (!function_exists('svc_table_exists')) {
+    function svc_table_exists($table){ global $wpdb;
+      return (bool)$wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table));
+    }
+  }
+  if (!function_exists('svc_column_exists')) {
+    function svc_column_exists($table, $col){ global $wpdb;
+      $c = $wpdb->get_var($wpdb->prepare("SHOW COLUMNS FROM {$table} LIKE %s", $col));
+      return !empty($c);
+    }
+  }
+  if (!function_exists('svc_table_columns')) {
+    function svc_table_columns($table){ global $wpdb; static $cache = array();
+      if (isset($cache[$table])) return $cache[$table];
+      $rows = $wpdb->get_results("SHOW COLUMNS FROM {$table}", ARRAY_A) ?: array();
+      $cache[$table] = array_map(fn($r)=>$r['Field'], $rows);
+      return $cache[$table];
+    }
+  }
+
+  // Trouver la table référencée par chercheur_id (ancienne ou nouvelle)
+  if ( ! function_exists('svc_find_chercheur_table') ) {
+    function svc_find_chercheur_table(){
+      global $wpdb;
+      foreach (array($wpdb->prefix.'rechercheold_chercheur', $wpdb->prefix.'recherche_chercheur') as $t){
+        $ok = $wpdb->get_var( $wpdb->prepare("SHOW TABLES LIKE %s",$t) );
+        if ($ok && $wpdb->get_var("SHOW COLUMNS FROM {$t} LIKE 'id'")) return $t;
+      }
+      return null;
+    }
+  }
+function svc_find_chercheur_table() {
+    global $wpdb;
+    return $wpdb->prefix . 'recherche_membre';
+}
+function svc_map_current_user_to_chercheur_id() {
+    $uid = get_current_user_id();
+    if (!$uid) {
+        error_log('[svc_map_current_user_to_chercheur_id] Aucun utilisateur connecté');
+        return null;
+    }
+    global $wpdb;
+
+    $t = svc_find_chercheur_table();
+    if (!$t) {
+        error_log('[svc_map_current_user_to_chercheur_id] Table des chercheurs introuvable');
+        return null;
+    }
+    error_log('[svc_map_current_user_to_chercheur_id] Table utilisée : ' . $t);
+
+    $cid = (int)$wpdb->get_var($wpdb->prepare("SELECT id FROM {$t} WHERE user_id=%d LIMIT 1", $uid));
+    if ($cid) {
+        error_log('[svc_map_current_user_to_chercheur_id] Chercheur ID trouvé via user_id: ' . $cid);
+        return $cid;
+    }
+
+    error_log('[svc_map_current_user_to_chercheur_id] Aucun chercheur_id trouvé pour user_id: ' . $uid);
+    return null;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+  // === reunion ===
+  function svc_reunion_table(){ global $wpdb; return $wpdb->prefix . 'recherche_reunion'; }
+if (!defined('ABSPATH')) exit;
+
+/** Helpers existants supposés:
+ * - svc_reseaux_table()
+ * - svc_reseaux_projets_table()
+ * - svc_laboratoire_table()
+ * - svc_current_labo_id()
+ * - svc_reseaux_args_create() / svc_reseaux_args_update()
+ * - svc_column_exists($table, $col)   // déjà utilisé côté publications
+ */
+
+// === (A) Champs autorisés & formats ===
+function svc_reseaux_allowed(){
+  // clef => [format, required?]   formats: int|date|bool|text|email|url
+  return [
+    'institution'       => ['text', true],
+    'pays'              => ['text', true],
+    'type_collab'       => ['text', true],     // tu l’utilises comme “Domaine” dans le front
+    'contact_nom'       => ['text', true],
+    'contact_email'     => ['email', true],
+    'contact_tel'       => ['text', false],
+    'site_web'          => ['url',  false],
+    'adresse_org'       => ['text', false],
+
+    'date_debut'        => ['date', true],     // YYYY-MM-DD
+    'date_fin'          => ['date', false],
+    'convention_signee' => ['bool', false],
+    'statut'            => ['text', false],    // optionnel
+
+    // médias (URLs) si tes colonnes existent
+    'logo_url'          => ['url',  false],
+    'avatar_url'        => ['url',  false],
+
+    // méta éventuelle
+    'notes'             => ['text', false],
+  ];
+}
+function svc_reseaux_fmt($fmt){
+  switch($fmt){
+    case 'int':  return '%d';
+    case 'bool': return '%d';
+    default:     return '%s';
+  }
+}
+function svc_reseaux_sanitize($fmt, $val){
+  if ($val === null) return null;
+  switch ($fmt){
+    case 'int':  return is_numeric($val) ? intval($val) : null;
+    case 'bool': return $val ? 1 : 0;
+    case 'date': return (is_string($val) && preg_match('/^\d{4}-\d{2}-\d{2}$/',$val)) ? $val : null;
+    case 'email':return is_email($val) ? sanitize_email($val) : null;
+    case 'url':  return is_string($val) ? esc_url_raw($val) : null;
+    default:     return is_scalar($val) ? sanitize_text_field($val) : wp_json_encode($val, JSON_UNESCAPED_UNICODE);
+  }
+}
+
+// === (B) Portée labo (membre/directeur) ===
+function svc_my_lab_ids(){
+  global $wpdb;
+  $uid = get_current_user_id();
+  if (!$uid) return [];
+  $lab_ids = [];
+  if (class_exists('UTM_Publication_Service')) {
+    $you = UTM_Publication_Service::get_current_memberships(); // ['member_ids'=>[], 'lab_ids'=>[]]
+    $lab_ids = $you['lab_ids'] ?: [];
+  } else {
+    // fallback: labos dirigés + labos où je suis membre
+    $lt = svc_laboratoire_table();
+    $mt = $wpdb->prefix.'recherche_membre';
+    $dir = $wpdb->get_col($wpdb->prepare("SELECT id FROM {$lt} WHERE directeur_user_id=%d",$uid)) ?: [];
+    $mem = $wpdb->get_col($wpdb->prepare("SELECT laboratoire_id FROM {$mt} WHERE user_id=%d",$uid)) ?: [];
+    $lab_ids = array_values(array_unique(array_merge($dir,$mem)));
+  }
+  return array_map('intval',$lab_ids);
+}
+function svc_is_director(){
+  if (class_exists('UTM_Publication_Service')) return UTM_Publication_Service::is_director();
+  $u = wp_get_current_user();
+  return in_array('um_directeur_laboratoire', (array)$u->roles, true);
+}
+
+// === (C) Fetch-guard: vérifie l’appartenance labo d’une ligne ===
+function svc_reseaux_fetch_owned($id){
+  global $wpdb;
+  $t  = svc_reseaux_table();
+  $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$t} WHERE id=%d",$id), ARRAY_A);
+  if (!$row) return [null, null];
+
+  $myLabs = svc_my_lab_ids();
+
+  // Cas 1: colonne laboratoire_id présente
+  if (svc_column_exists($t,'laboratoire_id') && isset($row['laboratoire_id'])){
+    return in_array((int)$row['laboratoire_id'], $myLabs, true) ? [$row, (int)$row['laboratoire_id']] : [null,null];
+  }
+
+  // Cas 2: pas de colonne labo -> on autorise si je suis directeur (plus permissif) OU si je suis l’auteur
+  if (svc_column_exists($t,'created_by') && (int)$row['created_by'] === get_current_user_id()) return [$row, null];
+  if (svc_is_director()) return [$row, null];
+
+  return [null,null];
+}
+
+// === (D) Routes REST ===
+add_action('rest_api_init', function(){
+  register_rest_route('plateforme-recherche/v1','/reseaux',[
+    [
+      'methods'  => 'GET',
+      'permission_callback' => function(){ return is_user_logged_in(); },
+      'callback' => 'svc_reseaux_list',
+    ],
+    [
+      'methods'  => 'POST',
+      'permission_callback' => function(){ return is_user_logged_in(); },
+      'callback' => 'svc_reseaux_create',
+    ],
+  ]);
+  register_rest_route('plateforme-recherche/v1','/reseaux/(?P<id>\d+)',[
+    [
+      'methods'  => 'GET',
+      'permission_callback' => function(){ return is_user_logged_in(); },
+      'callback' => 'svc_reseaux_get',
+    ],
+    [
+      'methods'  => 'PUT, PATCH',
+      'permission_callback' => function(){ return is_user_logged_in(); },
+      'callback' => 'svc_reseaux_update',
+    ],
+    [
+      'methods'  => 'DELETE',
+      'permission_callback' => function(){ return is_user_logged_in(); },
+      'callback' => 'svc_reseaux_delete',
+    ],
+  ]);
+});
+
+// === (E) Handlers ===
+function svc_reseaux_get(WP_REST_Request $req){
+  global $wpdb; 
+  $table = svc_reseaux_table();
+  $id = absint($req['id']);
+
+  $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+  if (!$row) return new WP_Error('not_found','Réseau introuvable', ['status'=>404]);
+
+  // Decode IDs
+  $ids = $row['projets_associes'] ? json_decode($row['projets_associes'], true) : [];
+
+  if (!empty($ids)) {
+    $in = implode(',', array_map('absint', $ids));
+    $tableProj = $wpdb->prefix.'recherche_projet';
+    $row['projets_associes'] = $wpdb->get_results("SELECT id, titre FROM $tableProj WHERE id IN ($in)", ARRAY_A);
+  } else {
+    $row['projets_associes'] = [];
+  }
+
+  $row['convention_signee'] = (int)$row['convention_signee'];
+  return $row;
+}
+
+
+
+function svc_reseaux_list(WP_REST_Request $req){
+  global $wpdb; $t = svc_reseaux_table();
+
+  $page = max(1, (int)($req->get_param('page') ?: 1));
+  $per  = max(1, min(200, (int)($req->get_param('per_page') ?: 50)));
+  $off  = ($page - 1) * $per;
+
+  $q    = trim((string)$req->get_param('search'));
+
+  $where=[]; $params=[];
+
+  // Restreindre au périmètre labo (chercheurs & directeurs du/ des labos)
+  $myLabs = svc_my_lab_ids();
+  if (svc_column_exists($t,'laboratoire_id') && !empty($myLabs)){
+    $where[] = "laboratoire_id IN (" . implode(',', array_map('intval',$myLabs)) . ")";
+  } else {
+    // fallback si pas de colonne: laisser tout le monde voir ses propres entrées
+    if (svc_column_exists($t,'created_by')) { $where[] = "created_by = %d"; $params[] = get_current_user_id(); }
+  }
+
+  // Recherche texte
+  if ($q!==''){
+    $like = '%'.$wpdb->esc_like($q).'%';
+    $where[]="(institution LIKE %s OR type_collab LIKE %s OR contact_nom LIKE %s OR contact_email LIKE %s)";
+    array_push($params,$like,$like,$like,$like);
+  }
+
+  $wsql = $where ? 'WHERE '.implode(' AND ',$where) : '';
+
+  $sql = "SELECT * FROM {$t} {$wsql} ORDER BY id DESC LIMIT %d OFFSET %d";
+  $params[]=$per; $params[]=$off;
+
+  $rows = $wpdb->get_results($wpdb->prepare($sql, ...$params), ARRAY_A) ?: [];
+  return $rows;
+}
+
+function svc_reseaux_create(WP_REST_Request $req){
+  global $wpdb;
+  $table = svc_reseaux_table();
+
+  $labo_id = (int) ($req['laboratoire_id'] ?: svc_current_labo_id());
+  if (!$labo_id) return new WP_Error('no_labo', 'Laboratoire introuvable', array('status'=>403));
+
+  // Upload si présent
+  $upload_info = reseaux_store_file_from_upload('piece_jointe');
+  if (is_wp_error($upload_info)) return $upload_info; // erreur upload
+
+  $ins = array(
+    'laboratoire_id'    => $labo_id,
+    'institution'       => sanitize_text_field($req['institution']),
+    'pays'              => sanitize_text_field($req['pays']),
+    'type_collab'       => sanitize_text_field($req['type_collab']),
+    'contact_nom'       => sanitize_text_field($req['contact_nom']),
+    'contact_email'     => sanitize_email($req['contact_email']),
+    'date_debut'        => sanitize_text_field($req['date_debut']),
+    'date_fin'          => $req['date_fin'] ? sanitize_text_field($req['date_fin']) : null,
+    'convention_signee' => absint($req['convention_signee']),
+    'statut'            => $req['statut'] ? sanitize_text_field($req['statut']) : 'Actif',
+    'piece_jointe_id'   => $req['piece_jointe_id'] ? absint($req['piece_jointe_id']) : null,
+    'projets_associes'  => !empty($req['projets_associes']) ? wp_json_encode(array_map('absint',(array)$req['projets_associes'])) : null,
+    'created_by'        => get_current_user_id(),
+    'created_at'        => current_time('mysql'),
+    // 🔹 Ajouts
+    'site_web'          => $req['site_web'] ? esc_url_raw($req['site_web']) : null,
+    'adresse_org'       => $req['adresse_org'] ? sanitize_text_field($req['adresse_org']) : null,
+  );
+  if ($upload_info && is_array($upload_info)) {
+    // si tu as ajouté la colonne
+    $ins['piece_jointe_path'] = sanitize_text_field($upload_info['path']);
+  }
+
+  $ok = $wpdb->insert($table, $ins);
+  if (!$ok) return new WP_Error('db_error','Insert failed',array('status'=>500));
+  $id = (int) $wpdb->insert_id;
+
+  $r  = new WP_REST_Request('GET', "/");
+  $r->set_url_params(['id'=>$id]);
+  return svc_reseaux_get($r);
+}
+
+
+function svc_reseaux_update(WP_REST_Request $req){
+  global $wpdb; $table = svc_reseaux_table();
+  $id = absint($req['id']);
+  if (!$id) return new WP_Error('bad_id','ID manquant', ['status'=>400]);
+
+  // Support override (si tu envoies POST + X-HTTP-Method-Override: PATCH)
+  $method = $_SERVER['REQUEST_METHOD'];
+  if ($method === 'POST') {
+    $override = isset($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE']) ? strtoupper($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE']) : '';
+    if (!in_array($override, array('PATCH','PUT',''), true)) {
+      return new WP_Error('bad_method','Méthode invalide', ['status'=>405]);
+    }
+  }
+
+  $data = array();
+  foreach (['institution','pays','type_collab','contact_nom','contact_email','date_debut','date_fin','statut'] as $k) {
+    if (isset($req[$k])) $data[$k] = ($k==='contact_email')? sanitize_email($req[$k]) : sanitize_text_field($req[$k]);
+  }
+
+  if (isset($req['site_web']))    $data['site_web']    = esc_url_raw($req['site_web']);
+if (isset($req['adresse_org'])) $data['adresse_org'] = sanitize_text_field($req['adresse_org']);
+
+  if (isset($req['convention_signee'])) $data['convention_signee'] = absint($req['convention_signee']);
+  if (isset($req['projets_associes']))  $data['projets_associes'] = wp_json_encode(array_map('absint',(array)$req['projets_associes']));
+
+  // Upload si présent
+  if (!empty($_FILES['piece_jointe']) && is_uploaded_file($_FILES['piece_jointe']['tmp_name'])) {
+    $upload_info = reseaux_store_file_from_upload('piece_jointe');
+    if (is_wp_error($upload_info)) return $upload_info;
+    // stocke le chemin
+    $data['piece_jointe_path'] = sanitize_text_field($upload_info['path']);
+  }
+
+  if (!$data) return new WP_Error('no_fields','Aucun champ', ['status'=>400]);
+  $data['updated_at'] = current_time('mysql');
+
+  $ok = $wpdb->update($table, $data, ['id'=>$id]);
+  if ($ok===false) return new WP_Error('db_error','Update failed', ['status'=>500]);
+
+  $r = new WP_REST_Request('GET', "/");
+  $r->set_url_params(['id'=>$id]);
+  return svc_reseaux_get($r);
+}
+
+
+function svc_reseaux_delete(WP_REST_Request $req){
+  global $wpdb; $t=svc_reseaux_table(); $id=(int)$req['id'];
+  [$row,$lab] = svc_reseaux_fetch_owned($id);
+  if (!$row) return new WP_Error('forbidden','Accès refusé',['status'=>403]);
+  $ok = $wpdb->delete($t,['id'=>$id],['%d']);
+  if (!$ok) return new WP_Error('db_error','Delete failed',['status'=>500]);
+  return new WP_REST_Response(null,204);
+}
+
+
+  // === these ===
+  function svc_these_table(){ global $wpdb; return $wpdb->prefix . 'recherche_these'; }
+  function svc_these_allowed(){ return array('date_debut', 'doctorant_nom', 'sujet', 'date_soutenance', 'encadrant_id', 'statut'); }
+
+  function svc_these_list(WP_REST_Request $req){
+    global $wpdb; $table = svc_these_table();
+    $page = max(1, intval($req->get_param('page') ?: 1));
+    $per  = max(1, min(200, intval($req->get_param('per_page') ?: 20)));
+    $off  = ($page - 1) * $per;
+    $sql  = $wpdb->prepare("SELECT * FROM $table ORDER BY id DESC LIMIT %d OFFSET %d", $per, $off);
+    return $wpdb->get_results($sql, ARRAY_A);
+  }
+
+  function svc_these_get(WP_REST_Request $req){
+    global $wpdb; $table = svc_these_table(); $id = intval($req['id']);
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d", $id), ARRAY_A);
+    if(!$row) return new WP_Error('not_found','Not found',array('status'=>404));
+    return $row;
+  }
+
+  function svc_these_create(WP_REST_Request $req){
+    global $wpdb; $table = svc_these_table(); $allowed = svc_these_allowed();
+    $data = svc_read_input($req); $ins = array();
+    foreach ($allowed as $k){
+      if(isset($data[$k])){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $ins[$k]=$v;
+      }
+    }
+    if(empty($ins)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->insert($table, $ins); if(!$ok) return new WP_Error('db_error','Insert failed',array('status'=>500));
+    $id = $wpdb->insert_id; return array('id'=>$id) + $ins;
+  }
+
+  function svc_these_update(WP_REST_Request $req){
+    global $wpdb; $table = svc_these_table(); $allowed = svc_these_allowed();
+    $id = intval($req['id']); $data = svc_read_input($req); $upd = array();
+    foreach ($allowed as $k){
+      if(array_key_exists($k,$data)){
+        if ($k === 'email') { $v = sanitize_email($data[$k]); }
+        else { $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]); }
+        $upd[$k]=$v;
+      }
+    }
+    if(empty($upd)) return new WP_Error('bad_request','No valid fields',array('status'=>400));
+    $ok = $wpdb->update($table, $upd, array('id'=>$id)); if($ok===false) return new WP_Error('db_error','Update failed',array('status'=>500));
+    return array('id'=>$id) + $upd;
+  }
+
+  function svc_these_delete(WP_REST_Request $req){
+    global $wpdb; $table = svc_these_table(); $id = intval($req['id']);
+    $ok = $wpdb->delete($table, array('id'=>$id)); if(!$ok) return new WP_Error('db_error','Delete failed',array('status'=>500));
+    return new WP_REST_Response(null, 204);
+  }
+
+// Reseaux
+
+function svc_reseaux_table()            { global $wpdb; return $wpdb->prefix . 'recherche_reseaux'; }
+function svc_reseaux_projets_table()    { global $wpdb; return $wpdb->prefix . 'recherche_reseaux_projets'; }
+
+/** Retourne l'ID du labo du directeur connecté */
+function svc_current_labo_id() {
+  $uid = get_current_user_id();
+  if (!$uid) return 0;
+  global $wpdb;
+  $table = svc_laboratoire_table();
+  return (int) $wpdb->get_var($wpdb->prepare("SELECT id FROM $table WHERE directeur_user_id=%d LIMIT 1", $uid));
+}
+
+
+/** === Args validators === */
+function svc_reseaux_args_create() {
+  return array(
+    'institution'       => array('required'=>true,  'sanitize_callback'=>'sanitize_text_field'),
+    'pays'              => array('required'=>true,  'sanitize_callback'=>'sanitize_text_field'),
+    'type_collab'       => array('required'=>true,  'sanitize_callback'=>'sanitize_text_field'),
+    'contact_nom'       => array('required'=>true,  'sanitize_callback'=>'sanitize_text_field'),
+    'contact_email'     => array('required'=>true,  'validate_callback'=>function($v){return is_email($v);}, 'sanitize_callback'=>'sanitize_email'),
+    'date_debut'        => array('required'=>true,  'validate_callback'=>fn($v)=>preg_match('/^\d{4}-\d{2}-\d{2}$/',$v),'sanitize_callback'=>'sanitize_text_field'),
+    'date_fin'          => array('required'=>false, 'validate_callback'=>fn($v)=>!$v||preg_match('/^\d{4}-\d{2}-\d{2}$/',$v),'sanitize_callback'=>'sanitize_text_field'),
+    'convention_signee' => array('required'=>false, 'sanitize_callback'=>'absint'),
+    'statut'            => array('required'=>false, 'sanitize_callback'=>'sanitize_text_field'),
+    'projets_associes'  => array('required'=>false), // array<int>
+    'piece_jointe_id'   => array('required'=>false, 'sanitize_callback'=>'absint'),
+    // en plus des champs déjà présents
+    'contact_tel'      => array('required'=>false, 'sanitize_callback'=>'sanitize_text_field'),
+    'site_web'         => array('required'=>false, 'sanitize_callback'=>'esc_url_raw'),
+    'adresse_org'      => array('required'=>false, 'sanitize_callback'=>'sanitize_text_field'),
+    'logo_url'         => array('required'=>false, 'sanitize_callback'=>'esc_url_raw'),
+    'avatar_url'       => array('required'=>false, 'sanitize_callback'=>'esc_url_raw'),
+    'contact_fonction' => array('required'=>false, 'sanitize_callback'=>'sanitize_text_field'),
+
+  );
+}
+function svc_reseaux_args_update(){ return svc_reseaux_args_create(); }
+
+
+
+/** === STATS === */
+function svc_reseaux_stats(WP_REST_Request $req){
+  global $wpdb; 
+  $table = svc_reseaux_table();
+  $uid   = get_current_user_id();
+
+  // Récupérer rôle(s)
+  $user  = wp_get_current_user();
+  $roles = (array) $user->roles;
+
+  // --- Cas 1 : paramètre explicite (admin/service UTM)
+  $labo_id = (int) $req->get_param('laboratoire_id');
+
+  // --- Cas 2 : directeur de labo
+  if (!$labo_id && in_array('um_directeur_laboratoire', $roles, true)) {
+    $labo_id = svc_current_labo_id();
+  }
+
+  // --- Cas 3 : chercheur => on lit son laboratoire_id depuis la table membre
+  if (!$labo_id && in_array('um_chercheur', $roles, true)) {
+    $labo_id = (int) $wpdb->get_var($wpdb->prepare(
+      "SELECT laboratoire_id 
+       FROM {$wpdb->prefix}recherche_membre 
+       WHERE user_id = %d 
+       LIMIT 1",
+      $uid
+    ));
+  }
+
+  if (!$labo_id) {
+    return new WP_Error('no_labo', 'Laboratoire introuvable', ['status'=>403]);
+  }
+
+  // --- Filtrage par année scolaire ou année civile ---
+  $scope = $req['scope'] ?: 'cards';
+  $year  = sanitize_text_field($req['year']); // "2024-2025" ou "2025"
+
+  if ($year && preg_match('/^\d{4}-\d{4}$/',$year)) {
+    list($y1,$y2) = explode('-', $year);
+    $d1="$y1-09-01"; $d2="$y2-08-31";
+  } else if ($year && preg_match('/^\d{4}$/',$year)) {
+    $d1="$year-01-01"; $d2="$year-12-31";
+  } else {
+    $d1='2000-01-01'; $d2='2999-12-31';
+  }
+
+  // --- Stats "cards" ---
+  if ($scope==='cards') {
+    $nationaux = (int) $wpdb->get_var($wpdb->prepare("
+      SELECT COUNT(*) FROM $table
+      WHERE laboratoire_id=%d
+        AND pays IN ('Tunisie','Tunis','TN','Tunisia')
+        AND date_debut >= %s 
+        AND COALESCE(date_fin,'2999-12-31')<=%s
+    ", $labo_id, $d1, $d2));
+
+    $internationaux = (int) $wpdb->get_var($wpdb->prepare("
+      SELECT COUNT(*) FROM $table
+      WHERE laboratoire_id=%d
+        AND NOT (pays IN ('Tunisie','Tunis','TN','Tunisia'))
+        AND date_debut >= %s 
+        AND COALESCE(date_fin,'2999-12-31')<=%s
+    ", $labo_id, $d1, $d2));
+
+    return compact('nationaux','internationaux');
+  }
+
+  // --- Stats "pie" ---
+  if ($scope==='pie') {
+    return $wpdb->get_results($wpdb->prepare("
+      SELECT pays, COUNT(*) AS n 
+      FROM $table
+      WHERE laboratoire_id=%d
+        AND date_debut >= %s 
+        AND COALESCE(date_fin,'2999-12-31')<=%s
+      GROUP BY pays 
+      ORDER BY n DESC 
+      LIMIT 6
+    ", $labo_id, $d1, $d2), ARRAY_A);
+  }
+
+  return new WP_Error('bad_scope','Scope invalide', ['status'=>400]);
+}
+
+
+/** === META === */
+function svc_reseaux_meta(){
+  return array(
+    'types'  => ['Projet De Recherche H2020','Cotutelle Doctorale','Article Scientifique','Échange & Co-Pub','Projet Bilatéral'],
+    'pays'   => ['France','Tunisie','Maroc','Belgique','Canada','Italie','Espagne'],
+    'statuts'=> ['Actif','Occasionnel','En cours','Clos']
+  );
+}
+
+/** === PROJETS du labo === */
+function svc_reseaux_projets(WP_REST_Request $req){
+  global $wpdb;
+  $labo_id = (int) ($req['laboratoire_id'] ?: svc_current_labo_id());
+  if (!$labo_id) return [];
+  $table_p = $wpdb->prefix.'utm_recherche_projet';
+  return $wpdb->get_results($wpdb->prepare("
+    SELECT id, titre FROM $table_p WHERE laboratoire_id=%d ORDER BY titre ASC
+  ", $labo_id), ARRAY_A);
+}
+
+// === Helpers supplémentaires ===
+function svc_user_institut_id($user_id=null){
+  $uid = $user_id ?: get_current_user_id();
+  if (!$uid) return 0;
+  return (int) get_user_meta($uid, 'institut_id', true);
+}
+
+/**
+ * Liste "visible" : (created_by = user) OR (reseaux.laboratoire_id IN labs de l'institut de l'user)
+ * Paramètres supportés (optionnels): q, pays, statut, has_convention, date_from, date_to, page, per_page
+ * Retourne aussi piece_jointe_url et duration_human
+ */
+function svc_reseaux_list_visible(WP_REST_Request $req){
+  global $wpdb;
+
+  $table_r = svc_reseaux_table();               // wp_utm_recherche_reseaux
+  $table_l = svc_laboratoire_table();           // wp_utm_recherche_laboratoire
+
+  $uid = get_current_user_id();
+  if (!$uid) return new WP_Error('forbidden','Utilisateur non connecté', ['status'=>403]);
+
+  $institut_id = svc_user_institut_id($uid);
+
+  // === Base WHERE : visibilité
+  $where  = ["(r.created_by = %d)"];
+  $params = [$uid];
+
+  if ($institut_id) {
+    // Ajoute la condition de visibilité par institut (labs de l'institut)
+    $where[] = "OR (r.laboratoire_id IN (SELECT id FROM $table_l WHERE etablissement_id = %d))";
+    $params[] = $institut_id;
+  }
+
+  // === Filtres
+  if ($q = trim((string)$req['q'])) {
+    $like = '%'.$wpdb->esc_like($q).'%';
+    $where[] = "AND (r.institution LIKE %s OR r.contact_nom LIKE %s OR r.type_collab LIKE %s)";
+    array_push($params, $like, $like, $like);
+  }
+  if ($pays = trim((string)$req['pays']))     { $where[] = "AND r.pays = %s"; $params[] = $pays; }
+  if ($statut = trim((string)$req['statut'])) { $where[] = "AND r.statut = %s"; $params[] = $statut; }
+  if ($hc = $req['has_convention'])           { $where[] = "AND r.convention_signee = %d"; $params[] = absint($hc); }
+  if ($df = $req['date_from'])                { $where[] = "AND r.date_debut >= %s"; $params[] = $df; }
+  if ($dt = $req['date_to'])                  { $where[] = "AND COALESCE(r.date_fin,'2999-12-31') <= %s"; $params[] = $dt; }
+
+  $page = max(1, (int)$req['page']);
+  $per  = min(100, max(5, (int)($req['per_page'] ?: 10)));
+  $off  = ($page-1)*$per;
+
+  // On ordonne pour privilégier "mes créations" en premier, puis plus récents
+  $sqlW = "WHERE " . implode(' ', $where);
+  $sql  = "
+    SELECT r.* 
+    FROM $table_r r
+    $sqlW
+    ORDER BY (r.created_by = %d) DESC, r.id DESC
+    LIMIT %d OFFSET %d
+  ";
+  $items = $wpdb->get_results( $wpdb->prepare($sql, array_merge($params, [$uid, $per, $off]) ), ARRAY_A );
+
+  // total
+  $total = (int) $wpdb->get_var( $wpdb->prepare("
+    SELECT COUNT(*) FROM $table_r r $sqlW
+  ", $params) );
+
+  // Enrichissement: piece_jointe_url + duration_human
+  foreach ($items as &$it) {
+    $it['projets_associes']   = $it['projets_associes'] ? json_decode($it['projets_associes'], true) : [];
+    $it['convention_signee']  = (int)$it['convention_signee'];
+    $it['piece_jointe_url']   = !empty($it['piece_jointe_id']) ? wp_get_attachment_url( (int)$it['piece_jointe_id'] ) : null;
+    $it['duration_human']     = svc_duration_human($it['date_debut'], $it['date_fin']);
+  }
+
+  return array('items'=>$items, 'total'=>$total, 'page'=>$page, 'per_page'=>$per);
+}
+function reseaux_store_file_from_upload($file_field = 'piece_jointe') {
+  if (empty($_FILES[$file_field]) || !is_uploaded_file($_FILES[$file_field]['tmp_name'])) {
+    return null; // pas de fichier
+  }
+  $file = $_FILES[$file_field];
+
+  // Dossier cible
+  $base_dir = WP_CONTENT_DIR . '/recherche/reseaux';
+  if (!file_exists($base_dir) && !wp_mkdir_p($base_dir)) {
+    return new WP_Error('mkdir_failed', 'Impossible de créer le dossier /wp-content/recherche/reseaux');
+  }
+
+  // Validation type
+  $ft = wp_check_filetype_and_ext($file['tmp_name'], $file['name']);
+  if (empty($ft['ext']) || empty($ft['type'])) {
+    return new WP_Error('bad_type', 'Type de fichier non autorisé');
+  }
+
+  // Nom unique
+  $filename = wp_unique_filename($base_dir, sanitize_file_name($file['name']));
+  $dest     = trailingslashit($base_dir) . $filename;
+
+  if (!@move_uploaded_file($file['tmp_name'], $dest)) {
+    return new WP_Error('move_failed', 'Échec du déplacement du fichier');
+  }
+  @chmod($dest, 0640);
+
+  // URL publique + chemin relatif
+  $url  = content_url('recherche/reseaux/' . $filename);
+  $path_rel = str_replace(ABSPATH, '/', $dest);
+
+  return array(
+    'path'     => $path_rel,   // à stocker en base: piece_jointe_path
+    'url'      => $url,
+    'filename' => $filename,
+    'mime'     => $ft['type'],
+    'size'     => @filesize($dest),
+  );
+}
+
+/** Durée lisible entre deux dates (YYYY-MM-DD) */
+function svc_duration_human($d1, $d2){
+  if (empty($d1)) return '-';
+  if (empty($d2)) return '—'; // durée ouverte
+  try {
+    $a = new DateTime($d1); $b = new DateTime($d2);
+    if ($b < $a) return '—';
+    $diff = $a->diff($b);
+    // priorise années/mois/jours
+    if ($diff->y > 0) return sprintf('%dan %dmois', $diff->y, $diff->m);
+    if ($diff->m > 0) return sprintf('%dmois %dj',  $diff->m, $diff->d);
+    return sprintf('%dj', $diff->d);
+  } catch (\Throwable $e) { return '-'; }
+}
+
+
+
+// Nom de table helper
+function svc_pays_table(){ 
+  global $wpdb; 
+  return $wpdb->prefix . 'pays'; // => wp_pays ; si ta table s'appelle utm_pays, remplace par: return 'utm_pays';
+}
+
+/**
+ * GET /plateforme-recherche/v1/pays
+ * Params:
+ *  - lang = fr|ar|en (default fr)
+ *  - q    = filtre texte (optionnel)
+ *  - actif = 0|1 (default 1)
+ *  - limit = nombre max (default 500)
+ */
+function svc_pays_list( WP_REST_Request $req ){
+  global $wpdb;
+  $table = svc_pays_table();
+
+  $lang = strtolower($req->get_param('lang') ?: 'fr');
+  $q    = trim((string)$req->get_param('q'));
+  $actif = ($req->get_param('actif') === '0') ? 0 : 1;
+  $limit = intval($req->get_param('limit') ?: 500);
+  if ($limit < 1 || $limit > 2000) $limit = 500;
+
+  // Colonne d'intitulé selon la langue
+  $col_map = ['fr' => 'intitule', 'ar' => 'intitule_ar', 'en' => 'intitule_en'];
+  $col = isset($col_map[$lang]) ? $col_map[$lang] : 'intitule';
+
+  // Base SQL
+  $where = ["actif = %d"];
+  $params = [$actif];
+
+  // Filtre texte (sur intitule fr/ar/en + code)
+  if ($q !== '') {
+    $where[] = "(intitule LIKE %s OR intitule_ar LIKE %s OR intitule_en LIKE %s OR code_iso2 LIKE %s OR code_iso3 LIKE %s)";
+    $like = '%' . $wpdb->esc_like($q) . '%';
+    array_push($params, $like, $like, $like, $like, $like);
+  }
+
+  $sql = "
+    SELECT id, code_iso2, code_iso3, $col AS libelle
+    FROM $table
+    WHERE " . implode(' AND ', $where) . "
+    ORDER BY libelle ASC
+    LIMIT %d
+  ";
+  $params[] = $limit;
+
+  $rows = $wpdb->get_results($wpdb->prepare($sql, $params), ARRAY_A);
+
+  return new WP_REST_Response([
+    'count' => count($rows),
+    'items' => array_map(function($r){
+      return [
+        'id'       => (int)$r['id'],
+        'code_iso2'=> $r['code_iso2'],
+        'code_iso3'=> $r['code_iso3'],
+        'libelle'  => $r['libelle'],
+      ];
+    }, $rows)
+  ], 200);
+}
+
+
+function svc_directeurs_list(WP_REST_Request $req){
+  global $wpdb;
+
+  if (!is_user_logged_in()){
+    return new WP_Error('forbidden','Utilisateur non connecté', ['status'=>403]);
+  }
+
+  $q       = trim((string)$req['q']);
+  $etabId  = $req->get_param('etablissement_id'); // correspond au usermeta 'institut_id'
+  $page    = max(1, (int)$req->get_param('page') ?: 1);
+  $per     = min(200, max(1, (int)$req->get_param('per_page') ?: 50));
+  $off     = ($page - 1) * $per;
+
+  // ---- Construction WP_User_Query
+  $args = array(
+    'role'    => 'um_directeur_laboratoire',
+    'orderby' => 'display_name',
+    'order'   => 'ASC',
+    'number'  => $per,
+    'offset'  => $off,
+    'fields'  => array('ID','display_name','user_email'),
+  );
+
+  // Filtre établissement via usermeta 'institut_id'
+  $meta_query = array();
+  if (!empty($etabId)) {
+    $meta_query[] = array(
+      'key'     => 'institut_id',
+      'value'   => (string)absint($etabId),
+      'compare' => '='
+    );
+  }
+  if (!empty($meta_query)) {
+    $args['meta_query'] = $meta_query;
+  }
+
+  // Recherche q (LIKE) : utilise le moteur de WP_User_Query
+  if ($q !== '') {
+    $args['search'] = '*' . esc_attr($q) . '*';
+    $args['search_columns'] = array('user_login','user_nicename','display_name','user_email');
+  }
+
+  $uq    = new WP_User_Query($args);
+  $users = $uq->get_results();
+  $total = (int)$uq->get_total();
+
+  // Build items + récupération du usermeta 'institut_id'
+  $items = array();
+  foreach ($users as $u) {
+    $uId = (int)$u->ID;
+    $institut_id_user = get_user_meta($uId, 'institut_id', true);
+    $items[] = array(
+      'id'             => $uId,
+      'display_name'   => $u->display_name,
+      'email'          => $u->user_email,
+      'avatar_url'     => get_avatar_url($uId),
+      'institut_id'    => $institut_id_user !== '' ? (int)$institut_id_user : null,
+      'label'          => (trim($u->display_name) !== '' ? $u->display_name : ('#'.$uId)),
+    );
+  }
+
+  return array(
+    'items'    => $items,
+    'total'    => $total,
+    'page'     => $page,
+    'per_page' => $per,
+  );
+}
+
+function svc_laboratoire_create(WP_REST_Request $req){
+  global $wpdb;
+  $table = svc_laboratoire_table();
+
+  $uid = get_current_user_id();
+  if (!$uid) return new WP_Error('forbidden','Utilisateur non connecté',['status'=>403]);
+
+  $etablissement_id  = absint($req->get_param('etablissement_id'));
+  $denomination      = $req->get_param('denomination') ?: $req->get_param('nom'); // compat
+  $domaine           = (string)$req->get_param('domaine');
+  $directeur_user_id = $req->get_param('directeur_user_id');
+  $directeur_user_id = ($directeur_user_id === null || $directeur_user_id==='') ? null : absint($directeur_user_id);
+
+  if (!$etablissement_id || !$denomination){
+    return new WP_Error('invalid_params','Champs requis: etablissement_id, denomination',['status'=>400]);
+  }
+
+  // === Si un directeur est fourni, valider + CONTRAINTE "déjà affecté"
+  if (!empty($directeur_user_id)) {
+    // 1) user existe
+    $u = get_user_by('id', $directeur_user_id);
+    if (!$u) return new WP_Error('not_found','Utilisateur (directeur) introuvable',['status'=>404]);
+
+    // 2) rôle (optionnel mais recommandé)
+    if (!in_array('um_directeur_laboratoire', (array)$u->roles, true)) {
+      return new WP_Error('role_mismatch',"L'utilisateur sélectionné n'a pas le rôle 'um_directeur_laboratoire'.",['status'=>400]);
+    }
+
+    // 3) même établissement via usermeta 'institut_id' (optionnel)
+    $user_institut = get_user_meta($directeur_user_id, 'institut_id', true);
+    if ($user_institut !== '' && $user_institut !== null) {
+      if ((int)$user_institut !== (int)$etablissement_id) {
+        return new WP_Error('institut_mismatch',"Le directeur choisi n'appartient pas au même établissement que le labo.",['status'=>400]);
+      }
+    }
+
+    // 4) CONTRAINTE : directeur déjà affecté à un autre labo ?
+    //   -> si tu veux restreindre au même établissement uniquement, ajoute "AND etablissement_id = %d"
+    $conflict = $wpdb->get_row(
+      $wpdb->prepare(
+        "SELECT id, denomination FROM $table WHERE directeur_user_id = %d LIMIT 1",
+        $directeur_user_id
+      ),
+      ARRAY_A
+    );
+    if ($conflict){
+      $msg = sprintf(
+        "Impossible d'affecter ce directeur : il est déjà rattaché au laboratoire #%d%s.",
+        (int)$conflict['id'],
+        !empty($conflict['denomination']) ? " (« {$conflict['denomination']} »)" : ''
+      );
+      return new WP_Error('director_already_assigned', $msg, ['status'=>409, 'conflict_lab'=>$conflict]);
+    }
+  }
+
+  // === Insertion
+  $ins = [
+    'etablissement_id' => $etablissement_id,
+    'denomination'     => sanitize_text_field($denomination),
+    'domaine'          => sanitize_text_field($domaine),
+    'created_by'       => $uid,
+    'created_at'       => current_time('mysql'),
+    'updated_at'       => current_time('mysql'),
+  ];
+  if (!empty($directeur_user_id)) {
+    $ins['directeur_user_id'] = $directeur_user_id; // seulement si fourni, pour éviter d'insérer 0/''.
+  }
+
+  $ok = $wpdb->insert($table, $ins);
+  if (!$ok){
+    return new WP_Error('db_error','Insertion échouée',['status'=>500,'mysql_error'=>$wpdb->last_error]);
+  }
+
+  $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id=%d",(int)$wpdb->insert_id), ARRAY_A);
+  if (!empty($row['directeur_user_id'])) {
+    $u = get_userdata((int)$row['directeur_user_id']);
+    if ($u){
+      $row['directeur_nom']    = $u->display_name;
+      $row['directeur_email']  = $u->user_email;
+      $row['directeur_avatar'] = get_avatar_url($u->ID);
+    }
+  }
+  return new WP_REST_Response($row, 201);
+}
+
+
+
+function svc_laboratoire_create_endpoint(WP_REST_Request $req){
+  $uid = get_current_user_id();
+  if (!$uid) return new WP_Error('forbidden','Utilisateur non connecté', ['status'=>403]);
+
+  $payload = [
+    'etablissement_id'  => $req->get_param('etablissement_id'),
+    'nom'               => $req->get_param('nom'),
+    'domaine'           => $req->get_param('domaine'),
+    'directeur_user_id' => $req->get_param('directeur_user_id'),
+  ];
+
+  $created = svc_laboratoire_create($uid, $payload);
+  if (is_wp_error($created)) return $created;
+
+  return new WP_REST_Response($created, 201);
+}
+
+
+
+
+
+// GET /plateforme-recherche/v1/financement/sources
+function svc_sources_list(WP_REST_Request $req){
+    global $wpdb;
+    $table = $wpdb->prefix . "recherche_source_financement";
+
+    $results = $wpdb->get_results("SELECT id, code, intitule, type, actif FROM $table ORDER BY intitule ASC", ARRAY_A);
+    return $results;
+}
+
+
+// Création d’une dépense
+function svc_projet_full(WP_REST_Request $req) {
+    global $wpdb;
+    $id    = intval($req['id']);
+    $table = svc_projet_table();
+
+    // --- Projet principal + chercheur + financement ---
+    $projet = $wpdb->get_row($wpdb->prepare(
+        "SELECT p.*, 
+                u.display_name AS chercheur_nom, 
+                sf.intitule AS financement_intitule
+         FROM $table p
+         LEFT JOIN {$wpdb->users} u 
+                ON p.chercheur_id = u.ID
+         LEFT JOIN {$wpdb->prefix}recherche_source_financement sf 
+                ON p.type_financement = sf.code
+         WHERE p.id = %d",
+        $id
+    ), ARRAY_A);
+
+    if (!$projet) {
+        return new WP_Error('not_found', 'Projet introuvable', ['status' => 404]);
+    }
+
+    // --- Objectifs ---
+  /*  $projet['objectifs'] = $wpdb->get_results($wpdb->prepare(
+        "SELECT id, projet_id, type, objectif 
+         FROM {$wpdb->prefix}recherche_projet_objectifs 
+         WHERE projet_id = %d 
+         ORDER BY id ASC",
+        $id
+    ), ARRAY_A);*/
+
+    // --- Membres ---
+    $projet['membres'] = $wpdb->get_results($wpdb->prepare(
+      "SELECT e.id,
+              e.projet_id,
+              e.user_id,
+              e.role_dans_projet,
+              um_grade.meta_value AS grade_id,
+              g.intitule AS grade_label,
+              e.email,
+              e.piece_jointe_path,
+              u.display_name,
+              u.user_email,
+              um_orcid.meta_value AS orcid,
+              um_avatar.meta_value AS avatar_url
+      FROM utm_recherche_projet_equipe e
+      LEFT JOIN utm_users u
+              ON e.user_id = u.id
+      LEFT JOIN {$wpdb->usermeta} um_grade
+              ON um_grade.user_id = e.user_id 
+            AND um_grade.meta_key = 'grade_id'
+      LEFT JOIN utm_grade g
+              ON g.id = um_grade.meta_value
+      LEFT JOIN {$wpdb->usermeta} um_orcid
+              ON um_orcid.user_id = e.user_id 
+            AND um_orcid.meta_key = 'orcid'
+      LEFT JOIN {$wpdb->usermeta} um_avatar
+              ON um_avatar.user_id = e.user_id 
+            AND um_avatar.meta_key = 'avatar_url'
+      WHERE e.projet_id = %d
+      ORDER BY e.id ASC",
+      $id
+  ), ARRAY_A);
+
+  // --- Phases ---
+  $projet['phases'] = $wpdb->get_results($wpdb->prepare(
+      "SELECT p.*,
+              u.display_name AS created_by_name,
+              u.user_email   AS created_by_email
+      FROM utm_recherche_projet_phase p
+      LEFT JOIN {$wpdb->users} u ON p.created_by = u.ID
+      WHERE p.projet_id = %d
+      ORDER BY p.id ASC",
+      $id
+  ), ARRAY_A);
+
+ foreach ($projet['phases'] as &$ph) {
+    $ph['taches'] = $wpdb->get_results($wpdb->prepare(
+        "SELECT t.*, u.display_name AS membre_nom
+         FROM utm_recherche_projet_tache t
+         LEFT JOIN {$wpdb->users} u ON t.membre_id = u.ID
+         WHERE t.phase_id = %d ORDER BY t.id ASC",
+        $ph['id']
+    ), ARRAY_A);
+
+    // === Calcul de progression ===
+    $taches = $ph['taches'];
+    if (empty($taches)) {
+        $ph['progression'] = 0;
+    } else {
+        $score = 0;
+        foreach ($taches as $t) {
+            $etat = strtolower($t['etat']);
+            if (strpos($etat, 'termin') !== false) {
+                $score += 100;
+            } elseif (strpos($etat, 'cours') !== false) {
+                $score += 50;
+            } else { // Prévu ou autre
+                $score += 0;
+            }
+        }
+        $ph['progression'] = round($score / count($taches));
+    }
+}
+
+
+    // --- Livrables ---
+    $projet['livrables'] = $wpdb->get_results($wpdb->prepare(
+        "SELECT * 
+         FROM {$wpdb->prefix}recherche_projet_livrables 
+         WHERE projet_id = %d
+         ORDER BY id ASC",
+        $id
+    ), ARRAY_A);
+
+    // --- Pièces jointes ---
+    $projet['pieces'] = $wpdb->get_results($wpdb->prepare(
+        "SELECT * 
+         FROM {$wpdb->prefix}recherche_projet_pieces 
+         WHERE projet_id = %d
+         ORDER BY id ASC",
+        $id
+    ), ARRAY_A);
+
+    // --- Dépenses (inchangé, SELECT * inclut désormais piece_jointe) ---
+    $projet['depenses'] = $wpdb->get_results($wpdb->prepare(
+        "SELECT d.*,
+                b.rubrique AS rubrique_ref
+        FROM {$wpdb->prefix}recherche_projet_depenses d
+        LEFT JOIN {$wpdb->prefix}recherche_projet_budget b 
+                ON d.budget_id = b.id
+        WHERE b.projet_id = %d
+        ORDER BY d.id ASC",
+        $id
+    ), ARRAY_A);
+
+  /*  var_dump(  "SELECT d.*,
+                b.rubrique AS rubrique_ref
+        FROM {$wpdb->prefix}recherche_projet_depenses d
+        LEFT JOIN {$wpdb->prefix}recherche_projet_budget b 
+                ON d.budget_id = b.id
+        WHERE b.projet_id = %d
+        ORDER BY d.id ASC");*/
+
+
+    
+
+
+    // --- Rubriques budgétaires ---
+  $projet['rubriques'] = $wpdb->get_results($wpdb->prepare(
+      "SELECT b.id,
+              b.projet_id,
+              b.rubrique,
+              b.montant_max,
+              b.montant_alloue,
+              b.fichier_justificatif,
+              b.created_at,
+              b.updated_at
+      FROM utm_recherche_projet_budget b
+      WHERE b.projet_id = %d
+      ORDER BY b.id ASC",
+      $id
+  ), ARRAY_A);
+
+
+    return $projet;
+}
+function svc_depense_create(WP_REST_Request $req) {
+    global $wpdb;
+
+    $table_dep = "{$wpdb->prefix}recherche_projet_depenses";
+    $table_budget = "{$wpdb->prefix}recherche_projet_budget";
+    $table_projet = svc_projet_table();
+
+    $data = svc_read_input($req);
+    $projet_id  = intval($req['projet_id']);
+    $rubrique_id = intval($data['rubrique_id'] ?? 0);
+
+    if (!$projet_id || !$rubrique_id) {
+        return new WP_Error('bad_request', 'Projet ou rubrique manquant', ['status' => 400]);
+    }
+
+    // --- Vérifier que le projet existe
+    $budget_projet = $wpdb->get_var($wpdb->prepare(
+        "SELECT budget FROM $table_projet WHERE id = %d",
+        $projet_id
+    ));
+    if ($budget_projet === null) {
+        return new WP_Error('not_found', 'Projet introuvable', ['status' => 404]);
+    }
+
+    // --- Récupérer la rubrique
+    $rubrique = $wpdb->get_row($wpdb->prepare(
+        "SELECT id, montant_max, montant_alloue FROM $table_budget WHERE id = %d AND projet_id = %d",
+        $rubrique_id, $projet_id
+    ));
+    if (!$rubrique) {
+        return new WP_Error('not_found', 'Rubrique introuvable', ['status' => 404]);
+    }
+
+    // --- Total des dépenses déjà saisies pour cette rubrique
+    $total_depenses_rubrique = floatval($wpdb->get_var($wpdb->prepare(
+        "SELECT SUM(montant) FROM $table_dep WHERE projet_id = %d AND rubrique_id = %d",
+        $projet_id, $rubrique_id
+    )) ?: 0);
+
+    $montant = floatval(str_replace(' ', '', $data['montant'] ?? 0));
+
+    // --- Vérification contre montant_max
+    if (($total_depenses_rubrique + $montant) > floatval($rubrique->montant_max)) {
+        return new WP_Error(
+            'rubrique_exceeded',
+            sprintf(
+                "Impossible d'ajouter la dépense : cumul actuel %.2f TND + nouvelle dépense %.2f TND > plafond de la rubrique (%.2f TND).",
+                $total_depenses_rubrique, $montant, $rubrique->montant_max
+            ),
+            ['status' => 400]
+        );
+    }
+
+    // --- Gestion upload fichier (optionnel)
+    $piece_jointe_url = '';
+    if (isset($_FILES['piece_jointe']) && $_FILES['piece_jointe']['error'] === UPLOAD_ERR_OK) {
+        require_once(ABSPATH . 'wp-admin/includes/media.php');
+        require_once(ABSPATH . 'wp-admin/includes/file.php');
+        require_once(ABSPATH . 'wp-admin/includes/image.php');
+        $attachment_id = media_handle_upload('piece_jointe', 0);
+        if (!is_wp_error($attachment_id)) {
+            $piece_jointe_url = wp_get_attachment_url($attachment_id);
+        }
+    }
+
+    // --- Insertion
+    $ins = [
+        'projet_id'    => $projet_id,
+        'budget_id'  => $rubrique_id,
+        'ref'          => sanitize_text_field($data['ref'] ?? ''),
+        'designation'  => sanitize_text_field($data['designation'] ?? ''),
+        'montant'      => $montant,
+        'date_depense' => sanitize_text_field($data['date_depense'] ?? null),
+        'piece_jointe' => sanitize_text_field($piece_jointe_url),
+        'created_at'   => current_time('mysql'),
+        'created_by'   => get_current_user_id(),
+    ];
+
+    $ok = $wpdb->insert($table_dep, $ins);
+    if (!$ok) {
+        return new WP_Error('db_error', 'Insert failed: ' . $wpdb->last_error, ['status' => 500]);
+    }
+
+    $ins['id'] = $wpdb->insert_id;
+    return $ins;
+}
+
+/*
+// GET /plateforme-recherche/v1/financement/suivi-sources
+function svc_suivi_sources(WP_REST_Request $req) {
+    global $wpdb;
+    $table_projet   = $wpdb->prefix . "recherche_projet";
+    $table_source   = $wpdb->prefix . "recherche_source_financement";
+    $table_depenses = $wpdb->prefix . "recherche_projet_depenses";
+
+    $sql = "SELECT s.id as idsource,
+                  p.type_financement as code,
+                   s.intitule as source_intitule,
+                   s.type as source_type,
+                   SUM(p.budget) as montant,
+                   COALESCE(SUM(d.total_depenses),0) as consomme
+            FROM $table_projet p
+            LEFT JOIN $table_source s ON p.type_financement = s.code
+            LEFT JOIN (
+                SELECT projet_id, SUM(montant) as total_depenses
+                FROM $table_depenses
+                GROUP BY projet_id
+            ) d ON p.id = d.projet_id
+            WHERE p.type_financement IS NOT NULL
+            GROUP BY p.type_financement, s.intitule, s.type
+            ORDER BY s.intitule ASC";
+
+    $rows = $wpdb->get_results($sql, ARRAY_A);
+
+    foreach ($rows as &$r) {
+        $r['montant']  = floatval($r['montant']);
+        $r['consomme'] = floatval($r['consomme']);
+        $r['solde']    = $r['montant'] - $r['consomme'];
+        $r['statut']   = ($r['solde'] > 0) ? 'Actif' : 'En cours';
+    }
+
+    return $rows;
+}
+
+
+// GET /plateforme-recherche/v1/financement/suivi-projets
+function svc_suivi_projets(WP_REST_Request $req){
+    global $wpdb;
+    $table_projet   = $wpdb->prefix . "recherche_projet";
+    $table_depenses = $wpdb->prefix . "recherche_projet_depenses";
+
+    // On ramène le projet avec son budget et son statut
+    $sql = "SELECT p.id, p.titre, p.budget, p.statut, p.updated_at,
+                   COALESCE(SUM(d.montant),0) as total_depenses
+            FROM $table_projet p
+            LEFT JOIN $table_depenses d ON p.id = d.projet_id
+            GROUP BY p.id, p.titre, p.budget, p.statut, p.updated_at
+            ORDER BY p.updated_at DESC";
+
+    $rows = $wpdb->get_results($sql, ARRAY_A);
+
+    foreach($rows as &$r){
+        $r['budget']   = floatval($r['budget']);
+        $r['depense']  = floatval($r['total_depenses']);
+        $r['reste']    = $r['budget'] - $r['depense'];
+        $r['statut']   = $r['statut'] ?: (($r['reste'] > 0) ? 'En cours' : 'Terminé');
+    }
+
+    return $rows;
+}
+*/
+
+
+// GET /plateforme-recherche/v1/financement/suivi-sources
+function svc_suivi_sources(WP_REST_Request $req) {
+    global $wpdb;
+    $table_projet   = $wpdb->prefix . "recherche_projet";
+    $table_source   = $wpdb->prefix . "recherche_source_financement";
+    $table_depenses = $wpdb->prefix . "recherche_projet_depenses";
+
+    $user   = wp_get_current_user();
+    $roles  = $user->roles;
+    $user_id = get_current_user_id();
+
+    $where = "WHERE p.type_financement IS NOT NULL";
+
+    // Cas 1 : Admin ou Service UTM → tous les projets
+    if (in_array('administrator', $roles) || in_array('um_service_utm', $roles)) {
+        // pas de filtre
+    }
+    // Cas 2 : Directeur de labo
+    elseif (in_array('um_directeur_laboratoire', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}recherche_laboratoire WHERE directeur_user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $where .= $wpdb->prepare(
+                " AND (p.chercheur_id = %d OR p.chercheur_id IN (
+                    SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                ))",
+                $user_id, $lab_id
+            );
+        }
+    }
+    // Cas 3 : Chercheur
+    elseif (in_array('um_chercheur', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT laboratoire_id FROM {$wpdb->prefix}recherche_membre WHERE user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $where .= $wpdb->prepare(
+                " AND (p.chercheur_id = %d
+                    OR p.chercheur_id IN (
+                        SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                    )
+                    OR p.chercheur_id IN (
+                        SELECT directeur_user_id FROM {$wpdb->prefix}recherche_laboratoire WHERE id = %d
+                    )
+                )",
+                $user_id, $lab_id, $lab_id
+            );
+        } else {
+            $where .= $wpdb->prepare(" AND p.chercheur_id = %d", $user_id);
+        }
+    }
+    // Cas 4 : Autres → seulement ses projets
+    else {
+        $where .= $wpdb->prepare(" AND p.chercheur_id = %d", $user_id);
+    }
+
+    $sql = "SELECT s.id as idsource,
+                   p.type_financement as code,
+                   s.intitule as source_intitule,
+                   s.type as source_type,
+                   SUM(p.budget) as montant,
+                   COALESCE(SUM(d.total_depenses),0) as consomme
+            FROM $table_projet p
+            LEFT JOIN $table_source s ON p.type_financement = s.code
+            LEFT JOIN (
+                SELECT projet_id, SUM(montant) as total_depenses
+                FROM $table_depenses
+                GROUP BY projet_id
+            ) d ON p.id = d.projet_id
+            $where
+            GROUP BY p.type_financement, s.intitule, s.type, s.id
+            ORDER BY s.intitule ASC";
+
+    $rows = $wpdb->get_results($sql, ARRAY_A);
+
+    foreach ($rows as &$r) {
+        $r['montant']  = floatval($r['montant']);
+        $r['consomme'] = floatval($r['consomme']);
+        $r['solde']    = $r['montant'] - $r['consomme'];
+        $r['statut']   = ($r['solde'] > 0) ? 'Actif' : 'En cours';
+    }
+
+    return $rows;
+}
+
+
+// GET /plateforme-recherche/v1/financement/suivi-projets
+function svc_suivi_projets(WP_REST_Request $req){
+    global $wpdb;
+    $table_projet   = $wpdb->prefix . "recherche_projet";
+    $table_depenses = $wpdb->prefix . "recherche_projet_depenses";
+
+    $user   = wp_get_current_user();
+    $roles  = $user->roles;
+    $user_id = get_current_user_id();
+
+    $where = "1=1";
+
+    // Cas 1 : Admin ou Service UTM → tous les projets
+    if (in_array('administrator', $roles) || in_array('um_service_utm', $roles)) {
+        // pas de filtre
+    }
+    // Cas 2 : Directeur de labo
+    elseif (in_array('um_directeur_laboratoire', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}recherche_laboratoire WHERE directeur_user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $where = $wpdb->prepare(
+                " (p.chercheur_id = %d OR p.chercheur_id IN (
+                    SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                ))",
+                $user_id, $lab_id
+            );
+        }
+    }
+    // Cas 3 : Chercheur
+    elseif (in_array('um_chercheur', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT laboratoire_id FROM {$wpdb->prefix}recherche_membre WHERE user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $where = $wpdb->prepare(
+                " (p.chercheur_id = %d
+                    OR p.chercheur_id IN (
+                        SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                    )
+                    OR p.chercheur_id IN (
+                        SELECT directeur_user_id FROM {$wpdb->prefix}recherche_laboratoire WHERE id = %d
+                    )
+                )",
+                $user_id, $lab_id, $lab_id
+            );
+        } else {
+            $where = $wpdb->prepare(" p.chercheur_id = %d", $user_id);
+        }
+    }
+    // Cas 4 : Autres
+    else {
+        $where = $wpdb->prepare(" p.chercheur_id = %d", $user_id);
+    }
+
+    $sql = "SELECT p.id, p.titre, p.budget, p.statut, p.updated_at,
+                   COALESCE(SUM(d.montant),0) as total_depenses
+            FROM $table_projet p
+            LEFT JOIN $table_depenses d ON p.id = d.projet_id
+            WHERE $where
+            GROUP BY p.id, p.titre, p.budget, p.statut, p.updated_at
+            ORDER BY p.updated_at DESC";
+
+    $rows = $wpdb->get_results($sql, ARRAY_A);
+
+    foreach($rows as &$r){
+        $r['budget']   = floatval($r['budget']);
+        $r['depense']  = floatval($r['total_depenses']);
+        $r['reste']    = $r['budget'] - $r['depense'];
+        $r['statut']   = $r['statut'] ?: (($r['reste'] > 0) ? 'En cours' : 'Terminé');
+    }
+
+    return $rows;
+}
+
+// GET /plateforme-recherche/v1/financement/stats
+function svc_financement_stats(WP_REST_Request $req){
+    global $wpdb;
+    $table = $wpdb->prefix . "recherche_projet";
+
+    $total = $wpdb->get_var("SELECT SUM(budget) FROM $table");
+    $sources = $wpdb->get_var("SELECT COUNT(DISTINCT type_financement) FROM $table");
+
+    return [
+        'budget_total' => $total ?: 0,
+        'sources_actives' => $sources ?: 0
+    ];
+}
+
+
+function svc_manifestation_categorie_table(){ global $wpdb; return $wpdb->prefix.'recherche_manifestation_categorie'; }
+function svc_manifestation_images_table(){ global $wpdb; return $wpdb->prefix.'recherche_manifestation_images'; }
+
+
+// élargir la whitelist
+function svc_manifestation_allowed(){
+  // anciens + nouveaux
+  return [
+    'date','intitule','type','user_id','lieu','preuve_url','role',
+    // nouveaux
+    'categorie_id','texte','image_url','statut','auteur_id','annee_academique',
+    'date_debut','date_fin','slug', 'laboratoire_id'  
+
+  ];
+}
+
+// CREATE (remplace ton actuel svc_manifestation_create)
+function svc_manifestation_create(WP_REST_Request $req){
+  global $wpdb; $table = svc_manifestation_table(); $allowed = svc_manifestation_allowed();
+  $data = svc_read_input($req); $ins = [];
+  $user   = wp_get_current_user();
+   $roles  = $user->roles;
+      $user_id = get_current_user_id();
+
+    if (in_array('um_directeur_laboratoire', $roles)) {
+          $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}recherche_laboratoire WHERE directeur_user_id = %d",
+            $user_id
+        ));
+      }
+    elseif (in_array('um_chercheur', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT laboratoire_id FROM {$wpdb->prefix}recherche_membre WHERE user_id = %d",
+            $user_id
+      ));
+    }
+   /* elseif (in_array('um_service-etablissement', $roles)) {
+
+        $etablissement_id= get_user_meta(get_current_user_id(), 'institut_id', true);
+           $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}recherche_laboratoire WHERE detablissement_id = %d",
+            $etablissement_id
+      ));
+    
+    }*/
+
+    if(!empty($lab_id)){
+      $ins['laboratoire_id']=$lab_id;
+    }
+
+  
+
+  foreach($allowed as $k){
+    if(isset($data[$k])){
+      if ($k === 'texte') {
+        $v = wp_kses_post($data[$k]); // ✅ garder HTML de Quill
+      } else {
+        $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]);
+      }
+      $ins[$k] = $v;
+    }
+  }
+
+
+  // défauts utiles
+  if (empty($ins['user_id'])) { $ins['user_id'] = get_current_user_id();} 
+  if (empty($ins['statut'])) $ins['statut'] = 'publie';
+  if (empty($ins['date']))      $ins['date'] = current_time('Y-m-d');
+
+  $ok = $wpdb->insert($table, $ins);
+  if(!$ok) return new WP_Error('db_error','Insert failed',['status'=>500]);
+  $id = (int)$wpdb->insert_id;
+
+
+  // ajout images si envoyées
+  if (!empty($_FILES['files'])) {
+  $img_req = new WP_REST_Request('POST', '/manifestation/'.$id.'/images');
+  $img_req->set_param('id', $id);   // ✅ injecter l’ID
+    svc_manifestation_images_add($img_req);
+  }
+
+  return ['id'=>$id] + $ins;
+}
+
+// UPDATE (remplace ton actuel svc_manifestation_update)
+function svc_manifestation_update(WP_REST_Request $req){
+  global $wpdb; $table = svc_manifestation_table(); $allowed = svc_manifestation_allowed();
+  $id = absint($req['id']); if(!$id) return new WP_Error('bad_id','ID manquant',['status'=>400]);
+  $data = svc_read_input($req); $upd = [];
+  
+  
+foreach($allowed as $k){
+  if(isset($data[$k])){
+    if ($k === 'texte') {
+      $v = wp_kses_post($data[$k]); // ✅ garder HTML de Quill
+    } else {
+      $v = is_scalar($data[$k]) ? sanitize_text_field($data[$k]) : wp_json_encode($data[$k]);
+    }
+    $ins[$k] = $v;
+  }
+}
+
+
+  if(empty($upd)) return new WP_Error('bad_request','No valid fields',['status'=>400]);
+  $ok = $wpdb->update($table, $upd, ['id'=>$id]);
+  if($ok===false) return new WP_Error('db_error','Update failed',['status'=>500]);
+
+  // ajout images si envoyées
+  if (!empty($_FILES['files'])) {
+  $img_req = new WP_REST_Request('POST', '/manifestation/'.$id.'/images');
+  $img_req->set_param('id', $id);   // ✅ injecter l’ID
+    svc_manifestation_images_add($img_req);
+  }
+
+  return ['id'=>$id] + $upd;
+}
+// Catégories
+function svc_manifestation_categories(WP_REST_Request $req){
+  global $wpdb; $t = svc_manifestation_categorie_table();
+  $rows = $wpdb->get_results("SELECT id, nom, description FROM $t ORDER BY nom ASC", ARRAY_A) ?: [];
+  return $rows;
+}
+
+// Upload multiples
+function svc_manifestation_images_add(WP_REST_Request $req){
+
+
+  global $wpdb; 
+  $t = svc_manifestation_images_table();
+
+  // ✅ récupérer correctement l'ID
+  $mid = absint($req->get_param('id') ?? ($_REQUEST['id'] ?? 0));
+  error_log("svc_manifestation_images_add mid=".$mid);
+
+  if(!$mid) return new WP_Error('bad_id','manifestation_id manquant',['status'=>400]);
+  if (empty($_FILES['files'])) return [];
+
+  // ✅ utiliser le dossier d'uploads WordPress
+  $upload_dir_info = wp_upload_dir();
+  $upload_dir = trailingslashit($upload_dir_info['basedir']).'manifestations';
+  $upload_url = trailingslashit($upload_dir_info['baseurl']).'manifestations';
+
+  if (!file_exists($upload_dir)) wp_mkdir_p($upload_dir);
+
+  $created = [];
+
+  // ✅ Cas multiples
+  if (is_array($_FILES['files']['name'])) {
+
+
+    foreach($_FILES['files']['name'] as $i=>$name){
+      if ($_FILES['files']['error'][$i] !== UPLOAD_ERR_OK) continue;
+      if (!is_uploaded_file($_FILES['files']['tmp_name'][$i])) continue;
+
+      $safe = wp_unique_filename($upload_dir, sanitize_file_name($name));
+      $dest = trailingslashit($upload_dir).$safe;
+
+      if (!@move_uploaded_file($_FILES['files']['tmp_name'][$i], $dest)) {
+        error_log("Erreur move_uploaded_file : ".$_FILES['files']['tmp_name'][$i]." => $dest");
+        continue;
+      }
+
+
+      $url = $upload_url.'/'.$safe;
+      $alt = sanitize_text_field(pathinfo($safe, PATHINFO_FILENAME));
+
+      $wpdb->insert($t, [
+        'manifestation_id' => $mid,
+        'image_url'        => $url,
+        'alt_text'         => $alt,
+        'ordre'            => (int)$i
+      ], ['%d','%s','%s','%d']);
+
+      $created[] = [
+        'id'        => $wpdb->insert_id,
+        'image_url' => $url,
+        'alt_text'  => $alt,
+        'ordre'     => $i
+      ];
+    }
+  }
+  // ✅ Cas single file
+  else {
+
+    if ($_FILES['files']['error'] === UPLOAD_ERR_OK && is_uploaded_file($_FILES['files']['tmp_name'])) {
+      $safe = wp_unique_filename($upload_dir, sanitize_file_name($_FILES['files']['name']));
+      $dest = trailingslashit($upload_dir).$safe;
+
+      if (@move_uploaded_file($_FILES['files']['tmp_name'], $dest)) {
+        $url = $upload_url.'/'.$safe;
+        $alt = sanitize_text_field(pathinfo($safe, PATHINFO_FILENAME));
+
+        $wpdb->insert($t, [
+          'manifestation_id' => $mid,
+          'image_url'        => $url,
+          'alt_text'         => $alt,
+          'ordre'            => 0
+        ], ['%d','%s','%s','%d']);
+
+        $created[] = [
+          'id'        => $wpdb->insert_id,
+          'image_url' => $url,
+          'alt_text'  => $alt,
+          'ordre'     => 0
+        ];
+      } else {
+        error_log("Échec upload single: ".$_FILES['files']['tmp_name']." → $dest");
+      }
+    }
+  }
+
+  return $created;
+}
+
+
+
+
+function svc_manifestation_images_list(WP_REST_Request $req){
+  global $wpdb; $t = svc_manifestation_images_table();
+  $mid = absint($req['id']);
+  return $wpdb->get_results($wpdb->prepare(
+    "SELECT id, image_url, alt_text, ordre FROM $t WHERE manifestation_id=%d ORDER BY ordre ASC, id ASC", $mid
+  ), ARRAY_A) ?: [];
+}
+
+function svc_manifestation_images_delete(WP_REST_Request $req){
+  global $wpdb; $t = svc_manifestation_images_table();
+  $mid = absint($req['id']); $img = absint($req->get_param('image_id'));
+  if(!$img) return new WP_Error('bad_id','image_id manquant',['status'=>400]);
+  $wpdb->delete($t, ['id'=>$img,'manifestation_id'=>$mid], ['%d','%d']);
+  return new WP_REST_Response(null,204);
+}
+function svc_manifestation_stats(WP_REST_Request $req){
+  global $wpdb; 
+  $t = svc_manifestation_table();
+  $tc = svc_manifestation_categorie_table();
+
+  // Plage année
+  $year = trim((string)$req->get_param('year'));
+  if ($year && preg_match('/^\d{4}-\d{4}$/',$year)){
+    [$y1,$y2] = explode('-', $year);
+    $d1="$y1-09-01"; $d2="$y2-08-31";
+  } elseif ($year && preg_match('/^\d{4}$/',$year)) {
+    $d1="$year-01-01"; $d2="$year-12-31";
+  } else {
+    $d1="2000-01-01"; $d2="2999-12-31";
+  }
+
+  // Dernière actu publiée
+  $sql = $wpdb->prepare(
+    "SELECT DATE_FORMAT(MAX(date_debut),'%%d/%%m/%%Y')
+    FROM $t 
+    WHERE statut='publie' 
+      AND date_debut IS NOT NULL
+      AND date_debut BETWEEN %s AND %s",
+    $d1, $d2
+  );
+
+  error_log("SQL Manifestation Last: $sql");
+
+  $last = $wpdb->get_var($sql);
+
+  
+
+
+  // Nombre ce mois
+  $firstDay = date('Y-m-01'); $lastDay = date('Y-m-t');
+  $nbMonth = (int)$wpdb->get_var($wpdb->prepare(
+    "SELECT COUNT(*) FROM $t WHERE statut='publie' AND date BETWEEN %s AND %s", $firstDay,$lastDay
+  ));
+
+  // Donut catégories
+  $rows = $wpdb->get_results($wpdb->prepare(
+    "SELECT c.nom AS categorie, COUNT(*) AS n
+     FROM $t m LEFT JOIN $tc c ON m.categorie_id=c.id
+     WHERE m.statut='publie' AND m.date BETWEEN %s AND %s
+     GROUP BY c.nom ORDER BY n DESC", $d1,$d2
+  ), ARRAY_A) ?: [];
+
+  $total = array_sum(array_map(fn($r)=> (int)$r['n'], $rows)) ?: 1;
+  $donut = array_map(function($r) use($total){
+    return ['label'=>$r['categorie'] ?: 'Non catégorisé', 'value'=> round(100*(int)$r['n']/$total)];
+  }, $rows);
+
+  // Liste des années dispo (distinct annee_academique non NULL)
+  $years = $wpdb->get_col("SELECT DISTINCT annee_academique FROM $t WHERE annee_academique IS NOT NULL ORDER BY annee_academique DESC");
+
+  return [
+    'last_published' => $last,
+    'count_this_month' => $nbMonth,
+    'donut' => $donut,
+    'years' => $years,
+  ];
+}
+function svc_manifestation_media(WP_REST_Request $req){
+  global $wpdb; 
+  $t  = svc_manifestation_table();
+  $ti = svc_manifestation_images_table();
+
+  // 3 manifestations récentes
+  $actus = $wpdb->get_results("
+    SELECT m.id, m.intitule AS title, DATE_FORMAT(m.date,'%d-%m-%Y') AS date,
+           (SELECT i.image_url FROM $ti i WHERE i.manifestation_id=m.id ORDER BY i.ordre ASC, i.id ASC LIMIT 1) AS cover
+    FROM $t m
+    WHERE m.statut='publie'
+    ORDER BY m.date DESC, m.id DESC
+    LIMIT 3
+  ", ARRAY_A) ?: [];
+
+  // 3 dernières images toutes manifestations confondues
+  $photos = $wpdb->get_results("
+    SELECT image_url, alt_text
+    FROM $ti
+    ORDER BY id DESC
+    LIMIT 3
+  ", ARRAY_A) ?: [];
+
+  return compact('actus','photos');
+}
+
+// GET /plateforme-recherche/v1/financement/source
+function svc_financement_source(WP_REST_Request $req) {
+    global $wpdb;
+    $id = intval($req->get_param('idsource'));
+    $table_projet   = $wpdb->prefix . "recherche_projet";
+    $table_source   = $wpdb->prefix . "recherche_source_financement";
+    $table_depenses = $wpdb->prefix . "recherche_projet_depenses";
+
+    if (!$id) {
+        return new WP_Error('missing_param', 'Paramètre idsource manquant', ['status' => 400]);
+    }
+
+    // ===== Contexte utilisateur =====
+    $user    = wp_get_current_user();
+    $roles   = (array) $user->roles;
+    $user_id = get_current_user_id();
+
+    // Base du WHERE pour filtrer les projets visibles
+    $where = $wpdb->prepare("WHERE s.id = %d AND p.type_financement IS NOT NULL", $id);
+
+    if (in_array('administrator', $roles) || in_array('um_service_utm', $roles)) {
+        // rien
+    } elseif (in_array('um_directeur_laboratoire', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}recherche_laboratoire WHERE directeur_user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $where .= $wpdb->prepare(
+                " AND (p.chercheur_id = %d OR p.chercheur_id IN (
+                    SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                ))",
+                $user_id, $lab_id
+            );
+        }
+    } elseif (in_array('um_chercheur', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT laboratoire_id FROM {$wpdb->prefix}recherche_membre WHERE user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $where .= $wpdb->prepare(
+                " AND (p.chercheur_id = %d
+                    OR p.chercheur_id IN (
+                        SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                    )
+                    OR p.chercheur_id IN (
+                        SELECT directeur_user_id FROM {$wpdb->prefix}recherche_laboratoire WHERE id = %d
+                    )
+                )",
+                $user_id, $lab_id, $lab_id
+            );
+        } else {
+            $where .= $wpdb->prepare(" AND p.chercheur_id = %d", $user_id);
+        }
+    } else {
+        $where .= $wpdb->prepare(" AND p.chercheur_id = %d", $user_id);
+    }
+
+    // ===== Requête principale (infos source) =====
+    $sql = "SELECT s.id, s.code, s.intitule, s.type, s.description,
+                   COUNT(p.id) as projets_associes,
+                   MIN(CASE WHEN p.date_debut IS NOT NULL THEN p.date_debut END) as date_debut,
+                   MAX(CASE WHEN p.date_fin IS NOT NULL THEN p.date_fin END) as date_fin,
+                   SUM(p.budget) as budget_total,
+                   COALESCE(SUM(d.total_depenses),0) as consomme,
+                   MAX(d.last_depense) as derniere_depense
+            FROM $table_source s
+            LEFT JOIN $table_projet p ON p.type_financement = s.code
+            LEFT JOIN (
+                SELECT projet_id, SUM(montant) as total_depenses, MAX(date_depense) as last_depense
+                FROM $table_depenses
+                GROUP BY projet_id
+            ) d ON p.id = d.projet_id
+            $where
+            GROUP BY s.id, s.code, s.intitule, s.type, s.description";
+
+    $row = $wpdb->get_row($sql, ARRAY_A);
+
+    if (!$row) {
+        return new WP_Error('not_found', 'Source introuvable ou non autorisée', ['status' => 404]);
+    }
+
+    // ===== Post-traitement des agrégats =====
+    $row['budget_total']  = floatval($row['budget_total']);
+    $row['consomme']      = floatval($row['consomme']);
+    $row['reste']         = $row['budget_total'] - $row['consomme'];
+    $row['taux']          = ($row['budget_total'] > 0)
+                            ? round(($row['consomme'] / $row['budget_total']) * 100, 2)
+                            : 0;
+    $row['statut']        = ($row['reste'] > 0) ? 'En cours' : 'Clôturé';
+
+    // ===== Récupération des projets + pièces =====
+    $sql_files = "SELECT p.id as projet_id, p.titre, p.date_debut, p.date_fin,
+                         p.budget_piece, p.convention_piece, p.created_at
+                  FROM $table_projet p
+                  INNER JOIN $table_source s ON p.type_financement = s.code
+                  WHERE s.id = %d";
+    $files = $wpdb->get_results($wpdb->prepare($sql_files, $id), ARRAY_A);
+
+    $row['pieces_jointes'] = [];
+    foreach ($files as $f) {
+        if (!empty($f['budget_piece'])) {
+            $row['pieces_jointes'][] = [
+                'projet_id' => $f['projet_id'],
+                'titre'     => $f['titre'],
+                'type_doc'  => 'Budget',
+                'url'       => $f['budget_piece'],
+                'date' => $f['created_at']
+            ];
+        }
+        if (!empty($f['convention_piece'])) {
+            $row['pieces_jointes'][] = [
+                'projet_id' => $f['projet_id'],
+                'titre'     => $f['titre'],
+                'type_doc'  => 'Convention',
+                'url'       => $f['convention_piece'],
+                'date' => $f['created_at']
+            ];
+        }
+    }
+
+    return $row;
+}
+
+
+
+// GET /plateforme-recherche/v1/financement/top-sources
+function svc_financement_top_sources(WP_REST_Request $req) {
+    global $wpdb;
+    $table_projet   = $wpdb->prefix . "recherche_projet";
+    $table_source   = $wpdb->prefix . "recherche_source_financement";
+    $table_depenses = $wpdb->prefix . "recherche_projet_depenses";
+
+    // ===== Contexte utilisateur =====
+    $user    = wp_get_current_user();
+    $roles   = (array) $user->roles;
+    $user_id = get_current_user_id();
+
+    // Base du WHERE
+    $where = "WHERE p.type_financement IS NOT NULL";
+
+    // Cas 1 : Admin ou Service UTM → tous les projets
+    if (in_array('administrator', $roles) || in_array('um_service_utm', $roles)) {
+        // pas de restriction
+    }
+    // Cas 2 : Directeur de labo
+    elseif (in_array('um_directeur_laboratoire', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}recherche_laboratoire WHERE directeur_user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $where .= $wpdb->prepare(
+                " AND (p.chercheur_id = %d OR p.chercheur_id IN (
+                    SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                ))",
+                $user_id, $lab_id
+            );
+        }
+    }
+    // Cas 3 : Chercheur
+    elseif (in_array('um_chercheur', $roles)) {
+        $lab_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT laboratoire_id FROM {$wpdb->prefix}recherche_membre WHERE user_id = %d",
+            $user_id
+        ));
+        if ($lab_id) {
+            $where .= $wpdb->prepare(
+                " AND (p.chercheur_id = %d
+                    OR p.chercheur_id IN (
+                        SELECT user_id FROM {$wpdb->prefix}recherche_membre WHERE laboratoire_id = %d
+                    )
+                    OR p.chercheur_id IN (
+                        SELECT directeur_user_id FROM {$wpdb->prefix}recherche_laboratoire WHERE id = %d
+                    )
+                )",
+                $user_id, $lab_id, $lab_id
+            );
+        } else {
+            $where .= $wpdb->prepare(" AND p.chercheur_id = %d", $user_id);
+        }
+    }
+    // Cas 4 : Autres rôles → seulement ses projets
+    else {
+        $where .= $wpdb->prepare(" AND p.chercheur_id = %d", $user_id);
+    }
+
+    // ===== Requête principale =====
+    $sql = "SELECT s.id, s.code, s.intitule, s.type,
+                   SUM(p.budget) as montant,
+                   COALESCE(SUM(d.total_depenses),0) as consomme
+            FROM $table_source s
+            INNER JOIN $table_projet p ON p.type_financement = s.code
+            LEFT JOIN (
+                SELECT projet_id, SUM(montant) as total_depenses
+                FROM $table_depenses
+                GROUP BY projet_id
+            ) d ON p.id = d.projet_id
+            $where
+            GROUP BY s.id, s.code, s.intitule, s.type
+            ORDER BY montant DESC
+            LIMIT 4";
+
+    $rows = $wpdb->get_results($sql, ARRAY_A);
+
+    foreach ($rows as &$r) {
+        $r['montant']  = floatval($r['montant']);
+        $r['consomme'] = floatval($r['consomme']);
+        $r['reste']    = $r['montant'] - $r['consomme'];
+        $r['taux']     = ($r['montant'] > 0)
+                         ? round(($r['consomme'] / $r['montant']) * 100, 2)
+                         : 0;
+    }
+
+    return $rows;
+}
+
+
+/** ========= Helpers de tables ========= */
+function svc_publication_table(){
+  global $wpdb; return $wpdb->prefix . 'recherche_publication';
+}
+/*
+function svc_membre_table(){
+  global $wpdb; return $wpdb->prefix . 'recherche_membre';
+}*/
+/*
+function svc_laboratoire_table(){
+  global $wpdb; return $wpdb->prefix . 'recherche_laboratoire';
+}*/
+
+/** ========= Route principale ========= */
+function svc_publications_list_route(WP_REST_Request $req){
+  $args = [
+    'laboratoire_id' => (int) ($req['laboratoire_id'] ?: 0),
+    'scope'          => $req['scope'] ?: 'all', // all|director|members
+    'statut'         => sanitize_text_field($req['statut'] ?: ''),     // ex: Validée
+    'type'           => sanitize_text_field($req['type']   ?: ''),     // ex: Article
+    'search'         => sanitize_text_field($req['search'] ?: ''),
+    'page'           => max(1, (int)($req['page'] ?: 1)),
+    'per_page'       => max(1, min(200, (int)($req['per_page'] ?: 20))),
+  ];
+
+  $out = svc_publications_list($args);
+
+  // Réponse + headers de pagination
+  $resp = new WP_REST_Response($out['items'], 200);
+  $resp->header('X-WP-Total', $out['total']);
+  $resp->header('X-WP-TotalPages', (string) ceil($out['total'] / $args['per_page']));
+  return $resp;
+}
+
+/** ========= Service cœur: liste publications ========= */
+function svc_publications_list(array $opt){
+  global $wpdb;
+  $pub   = svc_publication_table();
+  $memb  = svc_membre_table();
+  $laboT = svc_laboratoire_table();
+
+  $page = $opt['page']; $per = $opt['per_page']; $off = ($page-1)*$per;
+
+  $where = ["1=1"];
+  $bind  = [];
+
+  // Filtrage selon le scope demandé
+  if ($opt['scope'] === 'director') {
+    $lab_id = (int) $opt['laboratoire_id'];
+    if ($lab_id <= 0) { return ['items'=>[], 'total'=>0]; }
+
+    $director_id = (int) $wpdb->get_var(
+      $wpdb->prepare("SELECT directeur_user_id FROM $laboT WHERE id=%d", $lab_id)
+    );
+    if (!$director_id) { return ['items'=>[], 'total'=>0]; }
+
+    // Publis du directeur
+    $where[] = "p.chercheur_id = %d";
+    $bind[]  = $director_id;
+
+  } elseif ($opt['scope'] === 'members') {
+    $lab_id = (int) $opt['laboratoire_id'];
+    if ($lab_id <= 0) { return ['items'=>[], 'total'=>0]; }
+
+    // Publis des membres du labo (sous-requête, évite un IN dynamique)
+    $where[] = "p.chercheur_id IN (SELECT m.user_id FROM $memb m WHERE m.laboratoire_id=%d)";
+    $bind[]  = $lab_id;
+
+  } else {
+    // Scope "all": publications rattachées à ce labo via la colonne p.laboratoire_id
+    if (!empty($opt['laboratoire_id'])) {
+      $where[] = "p.laboratoire_id = %d";
+      $bind[]  = (int) $opt['laboratoire_id'];
+    }
+  }
+
+  // Filtres additionnels
+  if (!empty($opt['statut'])) {
+    $where[] = "p.statut = %s";
+    $bind[]  = $opt['statut'];
+  }
+  if (!empty($opt['type'])) {
+    $where[] = "p.type = %s";
+    $bind[]  = $opt['type'];
+  }
+  if (!empty($opt['search'])) {
+    // Recherche sur titre / doi / revue
+    $like = '%' . $wpdb->esc_like($opt['search']) . '%';
+    $where[] = "(p.titre LIKE %s OR p.doi LIKE %s OR p.revue LIKE %s)";
+    array_push($bind, $like, $like, $like);
+  }
+
+  $whereSQL = implode(' AND ', $where);
+
+  // SELECT avec jointures pour nom/pseudo de l’auteur
+ // ... juste avant $sql_base, prépare un whereStatut dynamique
+$statutsPublics = "LOWER(TRIM(p.statut)) IN ('validée','validee','publiée','publiee','published','valide')";
+if (!empty($opt['statut'])) {
+  // si l'appelant fournit statut, on se base sur lui
+  $whereStatut = "LOWER(TRIM(p.statut)) = LOWER(TRIM(%s))";
+  $bindStatut  = [$opt['statut']];
+} else {
+  $whereStatut = $statutsPublics;
+  $bindStatut  = [];
+}
+
+$sql_base = "
+  FROM $pub p
+    LEFT JOIN {$wpdb->users} u   ON u.ID = p.chercheur_id
+    LEFT JOIN {$wpdb->usermeta} fn ON fn.user_id = u.ID AND fn.meta_key='first_name'
+    LEFT JOIN {$wpdb->usermeta} ln ON ln.user_id = u.ID AND ln.meta_key='last_name'
+  WHERE $whereSQL AND $whereStatut
+";
+
+
+  $sql_items = "
+    SELECT 
+      p.id, p.date_publication, p.titre, p.type, p.chercheur_id, p.laboratoire_id,
+      p.doi, p.isbn, p.revue, p.statut, p.created_by, p.resume, p.commentaire,
+      u.user_login, u.display_name,
+      COALESCE(NULLIF(fn.meta_value,''),'') AS auteur_prenom,
+      COALESCE(NULLIF(ln.meta_value,''),'') AS auteur_nom
+    $sql_base
+    ORDER BY p.date_publication DESC, p.id DESC
+    LIMIT %d OFFSET %d
+  ";
+
+  $items = $wpdb->get_results(
+    $wpdb->prepare($sql_items, ...array_merge($bind, [$per, $off])), ARRAY_A
+  );
+
+
+
+  $sql_count = "SELECT COUNT(1) " . $sql_base;
+  $total = (int) $wpdb->get_var($wpdb->prepare($sql_count, ...$bind));
+
+  // Post-traitement: champ display pour auteur
+  foreach ($items as &$row) {
+    $full = trim(($row['auteur_prenom'] ?? '') . ' ' . ($row['auteur_nom'] ?? ''));
+    $row['auteur_display'] = $full !== '' ? $full : ($row['display_name'] ?: $row['user_login']);
+  }
+
+  return ['items'=>$items, 'total'=>$total];
+}
+
+
+
+/** ========= Wrappers nommés (appellent ton service existant) ========= */
+
+function svc_reseaux_by_lab(WP_REST_Request $req){
+  $req->set_param('laboratoire_id', (int)$req['laboratoire_id']);
+  return svc_reseaux_list_route($req);
+}
+
+function svc_reseaux_by_lab_type(WP_REST_Request $req){
+  $req->set_param('laboratoire_id', (int)$req['laboratoire_id']);
+  $req->set_param('type_collab', sanitize_text_field(rawurldecode($req['type_collab'])));
+  return svc_reseaux_list_route($req);
+}
+
+function svc_reseaux_by_lab_country(WP_REST_Request $req){
+  $req->set_param('laboratoire_id', (int)$req['laboratoire_id']);
+  $req->set_param('pays', sanitize_text_field(rawurldecode($req['pays'])));
+  return svc_reseaux_list_route($req);
+}
+
+function svc_reseaux_by_lab_status(WP_REST_Request $req){
+  $req->set_param('laboratoire_id', (int)$req['laboratoire_id']);
+  $req->set_param('statut', sanitize_text_field(rawurldecode($req['statut'])));
+  return svc_reseaux_list_route($req);
+}
+
+/** ===== Route handler ===== */
+function svc_reseaux_list_route(WP_REST_Request $req){
+  $opt = [
+    'laboratoire_id' => (int) $req->get_param('laboratoire_id'),
+    'statut'         => sanitize_text_field($req->get_param('statut') ?: ''),
+    'pays'           => sanitize_text_field($req->get_param('pays') ?: ''),
+    'type_collab'    => sanitize_text_field($req->get_param('type_collab') ?: ''),
+    'search'         => sanitize_text_field($req->get_param('search') ?: ''),
+    'page'           => max(1, (int)($req->get_param('page') ?: 1)),
+    'per_page'       => max(1, min(200, (int)($req->get_param('per_page') ?: 20))),
+    'order'          => (strtoupper($req->get_param('order')) === 'ASC') ? 'ASC' : 'DESC',
+    'orderby'        => $req->get_param('orderby') ?: 'date_debut',
+  ];
+
+  $out = svc_reseaux_list2($opt);
+
+  $resp = new WP_REST_Response($out['items'], 200);
+  $resp->header('X-WP-Total', (string)$out['total']);
+  $resp->header('X-WP-TotalPages', (string) ceil($out['total'] / $opt['per_page']));
+  return $resp;
+}
+
+/** ===== Service SQL ===== */
+function svc_reseaux_list2(array $opt){
+  global $wpdb;
+  $t = svc_reseaux_table();
+
+  $page = $opt['page']; $per = $opt['per_page']; $off = ($page-1)*$per;
+
+  // sécuriser orderby
+  $allowed = ['date_debut','date_fin','created_at','id'];
+  $orderby = in_array($opt['orderby'], $allowed, true) ? $opt['orderby'] : 'date_debut';
+  $order   = $opt['order'] === 'ASC' ? 'ASC' : 'DESC';
+
+  $where = ["r.laboratoire_id = %d"];
+  $bind  = [$opt['laboratoire_id']];
+
+  if ($opt['statut'] !== '') {
+    $where[] = "r.statut = %s";      $bind[] = $opt['statut'];
+  }
+  if ($opt['pays'] !== '') {
+    $where[] = "r.pays = %s";        $bind[] = $opt['pays'];
+  }
+  if ($opt['type_collab'] !== '') {
+    $where[] = "r.type_collab = %s"; $bind[] = $opt['type_collab'];
+  }
+  if ($opt['search'] !== '') {
+    $like = '%' . $wpdb->esc_like($opt['search']) . '%';
+    $where[] = "(r.institution LIKE %s OR r.contact_nom LIKE %s OR r.contact_email LIKE %s OR r.type_collab LIKE %s OR r.pays LIKE %s)";
+    array_push($bind, $like, $like, $like, $like, $like);
+  }
+
+  $whereSQL = implode(' AND ', $where);
+
+  $sql_base = "FROM $t r WHERE $whereSQL";
+
+  $sql_items = "
+    SELECT
+      r.id, r.laboratoire_id, r.institution, r.pays, r.type_collab,
+      r.contact_nom, r.contact_email, r.contact_tel,
+      r.date_debut, r.date_fin, r.convention_signee,
+      r.statut, r.piece_jointe_id, r.piece_jointe_path,
+      r.projets_associes, r.created_by, r.created_at, r.updated_at,
+      r.site_web, r.adresse_org
+    $sql_base
+    ORDER BY r.$orderby $order, r.id DESC
+    LIMIT %d OFFSET %d
+  ";
+
+  $items = $wpdb->get_results(
+    $wpdb->prepare($sql_items, ...array_merge($bind, [$per, $off])), ARRAY_A
+  );
+
+  // total
+  $sql_count = "SELECT COUNT(1) $sql_base";
+  $total = (int) $wpdb->get_var($wpdb->prepare($sql_count, ...$bind));
+
+  // normaliser champs (bool, json)
+  foreach ($items as &$r) {
+    $r['convention_signee'] = (int)$r['convention_signee']; // 0/1
+    $r['projets_associes']  = $r['projets_associes'] ? json_decode($r['projets_associes'], true) : [];
+    if (!is_array($r['projets_associes'])) $r['projets_associes'] = [];
+  }
+
+  return ['items'=>$items, 'total'=>$total];
+}
+
+
+
+
+/** ===== Route handler ===== */
+function svc_projet_list_by_lab_route(WP_REST_Request $req){
+  $opt = [
+    'laboratoire_id'  => (int) $req->get_param('laboratoire_id'),
+    'scope'           => $req->get_param('scope') ?: 'director_or_members',
+    'statut'          => sanitize_text_field($req->get_param('statut') ?: ''),
+    'type_financement'=> sanitize_text_field($req->get_param('type_financement') ?: ''),
+    'type_projet_id'  => (int) ($req->get_param('type_projet_id') ?: 0),
+    'search'          => sanitize_text_field($req->get_param('search') ?: ''),
+    'page'            => max(1, (int)($req->get_param('page') ?: 1)),
+    'per_page'        => max(1, min(200, (int)($req->get_param('per_page') ?: 20))),
+    'orderby'         => $req->get_param('orderby') ?: 'date_debut',
+    'order'           => strtoupper($req->get_param('order') ?: 'DESC'),
+  ];
+
+  if (!$opt['laboratoire_id']) {
+    return new WP_Error('bad_request', 'Paramètre laboratoire_id requis', ['status'=>400]);
+  }
+
+  $out = svc_projet_list_by_lab($opt);
+
+  $resp = new WP_REST_Response($out['items'], 200);
+  $resp->header('X-WP-Total', (string)$out['total']);
+  $resp->header('X-WP-TotalPages', (string) ceil($out['total'] / $opt['per_page']));
+  return $resp;
+}
+
+/** ===== Service SQL ===== */
+function svc_projet_list_by_lab(array $opt){
+  global $wpdb;
+
+  $projet = svc_projet_table();
+  $memb   = svc_membre_table();
+  $laboT  = svc_laboratoire_table();
+
+  $lab_id = (int) $opt['laboratoire_id'];
+
+  // Récup directeur
+  $director_id = (int) $wpdb->get_var(
+    $wpdb->prepare("SELECT directeur_user_id FROM $laboT WHERE id=%d", $lab_id)
+  );
+
+  // where de base selon scope
+  $scope_sql  = '';
+  $scope_bind = [];
+
+  if ($opt['scope'] === 'director') {
+    if (!$director_id) return ['items'=>[], 'total'=>0];
+    $scope_sql  = "p.chercheur_id = %d";
+    $scope_bind = [$director_id];
+
+  } elseif ($opt['scope'] === 'members') {
+    $scope_sql  = "p.chercheur_id IN (SELECT m.user_id FROM $memb m WHERE m.laboratoire_id=%d)";
+    $scope_bind = [$lab_id];
+
+  } else { // director_or_members
+    if ($director_id) {
+      $scope_sql  = "(p.chercheur_id = %d OR p.chercheur_id IN (SELECT m.user_id FROM $memb m WHERE m.laboratoire_id=%d))";
+      $scope_bind = [$director_id, $lab_id];
+    } else {
+      $scope_sql  = "p.chercheur_id IN (SELECT m.user_id FROM $memb m WHERE m.laboratoire_id=%d)";
+      $scope_bind = [$lab_id];
+    }
+  }
+
+  // filtres additionnels
+  $where = [$scope_sql];
+  $bind  = $scope_bind;
+
+  if (!empty($opt['statut'])) {
+    $where[] = "p.statut = %s";
+    $bind[]  = $opt['statut'];
+  }
+  if (!empty($opt['type_financement'])) {
+    $where[] = "p.type_financement = %s";
+    $bind[]  = $opt['type_financement'];
+  }
+  if (!empty($opt['type_projet_id'])) {
+    $where[] = "p.type_projet_id = %d";
+    $bind[]  = (int) $opt['type_projet_id'];
+  }
+  if (!empty($opt['search'])) {
+    $like = '%' . $wpdb->esc_like($opt['search']) . '%';
+    $where[] = "(p.titre LIKE %s OR p.objectifs LIKE %s OR p.resume LIKE %s)";
+    array_push($bind, $like, $like, $like);
+  }
+
+  $whereSQL = implode(' AND ', $where);
+
+  // order by sécurisé
+  $allowed = ['date_debut','date_fin','created_at','id'];
+  $orderby = in_array($opt['orderby'], $allowed, true) ? $opt['orderby'] : 'date_debut';
+  $order   = ($opt['order'] === 'ASC') ? 'ASC' : 'DESC';
+
+  $page = $opt['page']; $per = $opt['per_page']; $off = ($page - 1) * $per;
+
+  // base avec jointure utilisateur pour le nom du porteur
+  $sql_base = "
+    FROM $projet p
+      LEFT JOIN {$wpdb->users} u   ON u.ID = p.chercheur_id
+      LEFT JOIN {$wpdb->usermeta} fn ON fn.user_id = u.ID AND fn.meta_key='first_name'
+      LEFT JOIN {$wpdb->usermeta} ln ON ln.user_id = u.ID AND ln.meta_key='last_name'
+    WHERE $whereSQL
+  ";
+
+  // items
+  $sql_items = "
+    SELECT DISTINCT
+      p.id, p.date_debut, p.titre, p.type_projet_id, p.budget, p.chercheur_id,
+      p.date_fin, p.resume, p.statut, p.objectifs,
+      p.budget_piece, p.convention_piece, p.type_financement,
+      p.created_at, p.updated_at,
+      u.user_login, u.display_name,
+      COALESCE(NULLIF(fn.meta_value,''),'') AS auteur_prenom,
+      COALESCE(NULLIF(ln.meta_value,''),'') AS auteur_nom
+    $sql_base
+    ORDER BY p.$orderby $order, p.id DESC
+    LIMIT %d OFFSET %d
+  ";
+  $items = $wpdb->get_results(
+    $wpdb->prepare($sql_items, ...array_merge($bind, [$per, $off])), ARRAY_A
+  );
+
+  // total
+  $sql_count = "SELECT COUNT(DISTINCT p.id) $sql_base";
+  $total = (int) $wpdb->get_var($wpdb->prepare($sql_count, ...$bind));
+
+  // post-traitement pour le front
+  foreach ($items as &$r) {
+    $full = trim(($r['auteur_prenom'] ?? '') . ' ' . ($r['auteur_nom'] ?? ''));
+    $r['chercheur_nom']          = $full !== '' ? $full : ($r['display_name'] ?: $r['user_login']);
+    $r['financement_intitule']   = $r['type_financement'] ?: ''; // alias apprécié par ton JS
+  }
+
+  return ['items'=>$items, 'total'=>$total];
+}
+
+
+
+/** ===== Tables ===== */
+
+/*
+function svc_manifestation_table(){
+  global $wpdb; return $wpdb->prefix . 'recherche_manifestation';
+}
+function svc_manifestation_categorie_table(){
+  // si tu as une table de catégories dédiée, adapte le nom ici :
+  global $wpdb; return $wpdb->prefix . 'recherche_manifestation_categorie';
+}
+*/
+/** ===== Endpoints ===== */
+
+add_action('rest_api_init', function () {
+
+  // /manifestation/by-lab?laboratoire_id=11&categorie_id=&type=&statut=&date_from=&date_to=&search=&page=&per_page=
+  register_rest_route('plateforme-recherche/v1', '/manifestation/by-lab', [
+    'methods'  => WP_REST_Server::READABLE,
+    'callback' => 'svc_manifestation_list_by_lab_route',
+    'permission_callback' => '__return_true',
+    'args' => [
+      'laboratoire_id' => ['type'=>'integer','required'=>true],
+      'categorie_id'   => ['type'=>'integer','required'=>false],
+      'type'           => ['type'=>'string', 'required'=>false],
+      'statut'         => ['type'=>'string', 'required'=>false], // publie | brouillon | archive
+      'date_from'      => ['type'=>'string', 'required'=>false], // YYYY-MM-DD
+      'date_to'        => ['type'=>'string', 'required'=>false], // YYYY-MM-DD
+      'search'         => ['type'=>'string', 'required'=>false],
+      'page'           => ['type'=>'integer','required'=>false,'default'=>1],
+      'per_page'       => ['type'=>'integer','required'=>false,'default'=>20],
+      'orderby'        => ['type'=>'string', 'required'=>false,'enum'=>['date_debut','date_fin','date','created_at','id'],'default'=>'date_debut'],
+      'order'          => ['type'=>'string', 'required'=>false,'enum'=>['ASC','DESC'],'default'=>'DESC'],
+    ],
+  ]);
+
+  // alias lisible : /manifestation/lab/{laboratoire_id}
+  register_rest_route('plateforme-recherche/v1', '/manifestation/lab/(?P<laboratoire_id>\d+)', [
+    'methods'  => WP_REST_Server::READABLE,
+    'callback' => function(WP_REST_Request $req){
+      return svc_manifestation_list_by_lab_route($req);
+    },
+    'permission_callback' => '__return_true',
+  ]);
+
+  // catégories disponibles pour un labo : /manifestation/categories/lab/{laboratoire_id}
+  register_rest_route('plateforme-recherche/v1', '/manifestation/categories/lab/(?P<laboratoire_id>\d+)', [
+    'methods'  => WP_REST_Server::READABLE,
+    'callback' => 'svc_manifestation_categories_by_lab_route',
+    'permission_callback' => '__return_true',
+  ]);
+});
+
+/** ===== Route handlers ===== */
+function svc_manifestation_list_by_lab_route(WP_REST_Request $req){
+  $opt = [
+    'laboratoire_id' => (int) $req->get_param('laboratoire_id'),
+    'categorie_id'   => (int) ($req->get_param('categorie_id') ?: 0),
+    'type'           => sanitize_text_field($req->get_param('type') ?: ''),
+    'statut'         => sanitize_text_field($req->get_param('statut') ?: ''),
+    'date_from'      => sanitize_text_field($req->get_param('date_from') ?: ''),
+    'date_to'        => sanitize_text_field($req->get_param('date_to') ?: ''),
+    'search'         => sanitize_text_field($req->get_param('search') ?: ''),
+    'page'           => max(1, (int)($req->get_param('page') ?: 1)),
+    'per_page'       => max(1, min(200, (int)($req->get_param('per_page') ?: 20))),
+    'orderby'        => $req->get_param('orderby') ?: 'date_debut',
+    'order'          => strtoupper($req->get_param('order') ?: 'DESC'),
+  ];
+  if (!$opt['laboratoire_id']) return new WP_Error('bad_request','laboratoire_id requis',['status'=>400]);
+
+  $out = svc_manifestation_list_by_lab($opt);
+  $resp = new WP_REST_Response($out['items'], 200);
+  $resp->header('X-WP-Total', (string)$out['total']);
+  $resp->header('X-WP-TotalPages', (string) ceil($out['total'] / $opt['per_page']));
+  return $resp;
+}
+
+function svc_manifestation_categories_by_lab_route(WP_REST_Request $req){
+  global $wpdb;
+  $lab_id = (int) $req->get_param('laboratoire_id');
+  if (!$lab_id) return new WP_Error('bad_request','laboratoire_id requis',['status'=>400]);
+
+  $m   = svc_manifestation_table();
+  $cat = svc_manifestation_categorie_table();
+
+  $table_exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $cat)) === $cat;
+
+  if ($table_exists) {
+    // ✅ c.nom (et pas c.intitule)
+    $sql = "
+      SELECT DISTINCT c.id, COALESCE(NULLIF(c.nom,''), CONCAT('Catégorie ', c.id)) AS nom
+      FROM $m m
+      LEFT JOIN $cat c ON c.id = m.categorie_id
+      WHERE m.laboratoire_id = %d AND m.categorie_id IS NOT NULL
+      ORDER BY nom ASC
+    ";
+    $rows = $wpdb->get_results($wpdb->prepare($sql, $lab_id), ARRAY_A);
+  } else {
+    $sql = "
+      SELECT DISTINCT m.categorie_id AS id, CONCAT('Catégorie ', m.categorie_id) AS nom
+      FROM $m m
+      WHERE m.laboratoire_id = %d AND m.categorie_id IS NOT NULL
+      ORDER BY nom ASC
+    ";
+    $rows = $wpdb->get_results($wpdb->prepare($sql, $lab_id), ARRAY_A);
+  }
+  return $rows ?: [];
+}
+
+
+/** ===== Service SQL ===== */
+function svc_manifestation_list_by_lab(array $opt){
+  global $wpdb;
+  $m   = svc_manifestation_table();
+  $cat = svc_manifestation_categorie_table();
+
+  $page = $opt['page']; $per = $opt['per_page']; $off = ($page-1)*$per;
+
+  // colonnes d’ordre whitelistees → colonne SQL pleinement qualifiée
+  $allowed  = ['date_debut','date_fin','date','created_at','id'];
+  $ordKey   = in_array($opt['orderby'],$allowed,true) ? $opt['orderby'] : 'date_debut';
+  $ordMap   = [
+    'date_debut' => 'm.date_debut',
+    'date_fin'   => 'm.date_fin',
+    'date'       => 'm.`date`',     // colonne existe et est nommée "date"
+    'created_at' => 'm.created_at',
+    'id'         => 'm.id',
+  ];
+  $orderby  = $ordMap[$ordKey];
+  $order    = ($opt['order']==='ASC') ? 'ASC' : 'DESC';
+
+  $where = ["m.laboratoire_id = %d"];
+  $bind  = [$opt['laboratoire_id']];
+
+  if (!empty($opt['categorie_id'])) { $where[] = "m.categorie_id = %d"; $bind[] = (int) $opt['categorie_id']; }
+  if (!empty($opt['type']))         { $where[] = "m.type = %s";        $bind[] = $opt['type']; }
+  if (!empty($opt['statut']))       { $where[] = "m.statut = %s";      $bind[] = $opt['statut']; }
+
+  // La table a bien "date" + "date_debut" + "date_fin" → fallback sûr
+  if (!empty($opt['date_from'])) { $where[] = "COALESCE(m.date_debut, m.`date`) >= %s"; $bind[] = $opt['date_from']; }
+  if (!empty($opt['date_to']))   { $where[] = "COALESCE(m.date_fin, m.date_debut, m.`date`) <= %s"; $bind[] = $opt['date_to']; }
+
+  if (!empty($opt['search'])) {
+    $like = '%'.$wpdb->esc_like($opt['search']).'%';
+    $where[] = "(m.intitule LIKE %s OR m.texte LIKE %s OR m.lieu LIKE %s)";
+    array_push($bind, $like, $like, $like);
+  }
+
+  $whereSQL    = implode(' AND ', $where);
+  $table_exists= $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $cat)) === $cat;
+  $join_cat    = $table_exists ? "LEFT JOIN $cat c ON c.id = m.categorie_id" : "";
+
+  $sql_base = "FROM $m m $join_cat WHERE $whereSQL";
+
+  // ✅ c.nom (et pas c.intitule)
+  $sql_items = "
+    SELECT
+      m.id, m.intitule, m.texte, m.type, m.categorie_id,
+      m.`date`, m.date_debut, m.date_fin, m.lieu, m.preuve_url, m.statut,
+      ".($table_exists ? "COALESCE(NULLIF(c.nom,''), CONCAT('Catégorie ', m.categorie_id))"
+                        : "CONCAT('Catégorie ', m.categorie_id)")." AS categorie
+    $sql_base
+    ORDER BY $orderby $order, m.id DESC
+    LIMIT %d OFFSET %d
+  ";
+
+  $items = $wpdb->get_results($wpdb->prepare($sql_items, ...array_merge($bind, [$per,$off])), ARRAY_A);
+  $total = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(1) $sql_base", ...$bind));
+
+  foreach ($items as &$r) {
+    $r['intitule']  = $r['intitule'] ?: 'Manifestation';
+    $r['categorie'] = $r['categorie'] ?: ($r['type'] ?: 'Autre');
+  }
+  return ['items'=>$items, 'total'=>$total];
+}
+
+function add_notification($user_id, $message, $type = 'affectation') {
+  global $wpdb;
+  $table = $wpdb->prefix . 'recherche_notification';
+
+  $wpdb->insert($table, [
+    'user_id'    => intval($user_id),
+    'message'    => sanitize_text_field($message),
+    'type'       => sanitize_text_field($type),
+    'lu'         => 0,
+    'created_at' => current_time('mysql')
+  ]);
+}
+
+
+function svc_notification_list(WP_REST_Request $req) {
+  global $wpdb;
+  $table = $wpdb->prefix . 'recherche_notification';
+
+  $user_id = get_current_user_id();
+  if (!$user_id) return new WP_Error('not_logged_in', 'Utilisateur non connecté', ['status'=>401]);
+
+  $per   = max(1, min(50, intval($req->get_param('per_page') ?: 10)));
+  $page  = max(1, intval($req->get_param('page') ?: 1));
+  $off   = ($page-1) * $per;
+
+  $rows = $wpdb->get_results($wpdb->prepare(
+    "SELECT id, user_id, message, type, lu, created_at
+     FROM $table
+     WHERE user_id=%d
+     ORDER BY created_at DESC
+     LIMIT %d OFFSET %d",
+    $user_id, $per, $off
+  ), ARRAY_A);
+
+  return rest_ensure_response($rows ?: []);
+}
+
+function add_projet_equipe(WP_REST_Request $req) {
+    global $wpdb;
+
+    $projet_id = intval($req['id']);
+    $user_id   = intval($req->get_param('user_id'));
+    $role      = sanitize_text_field($req->get_param('role'));
+    $grade     = sanitize_text_field($req->get_param('grade'));
+    $email     = sanitize_email($req->get_param('email'));
+
+    // Debug
+    error_log('add_projet_equipe called. FILES=' . print_r($_FILES, true));
+
+    // === Contrôle doublon user ===
+    $exists = $wpdb->get_var($wpdb->prepare(
+        "SELECT COUNT(*) FROM utm_recherche_projet_equipe WHERE projet_id = %d AND user_id = %d",
+        $projet_id, $user_id
+    ));
+
+    if ($exists > 0) {
+        return new WP_REST_Response([
+            'success' => false,
+            'message' => 'Ce membre est déjà affecté à ce projet.'
+        ], 400);
+    }
+
+    // === Contrôle unicité Responsable du projet ===
+    if (strtolower($role) === 'responsable du projet') {
+        $responsable_exists = $wpdb->get_var($wpdb->prepare(
+            "SELECT COUNT(*) FROM utm_recherche_projet_equipe WHERE projet_id = %d AND role_dans_projet = %s",
+            $projet_id, 'responsable du projet'
+        ));
+        if ($responsable_exists > 0) {
+            return new WP_REST_Response([
+                'success' => false,
+                'message' => 'Un responsable est déjà défini pour ce projet.'
+            ], 400);
+        }
+    }
+
+    // === Gestion upload fichier ===
+    $piece_jointe_path = null;
+    if (!empty($_FILES['piece_jointe']['name'])) {
+        require_once(ABSPATH . 'wp-admin/includes/file.php');
+        require_once(ABSPATH . 'wp-admin/includes/media.php');
+        require_once(ABSPATH . 'wp-admin/includes/image.php');
+
+        $attach_id = media_handle_upload('piece_jointe', 0);
+        if (!is_wp_error($attach_id)) {
+            $piece_jointe_path = wp_get_attachment_url($attach_id);
+        } else {
+            error_log('Erreur upload: ' . $attach_id->get_error_message());
+        }
+    }
+
+    // === Insertion dans la table ===
+    $inserted = $wpdb->insert("utm_recherche_projet_equipe", [
+        'projet_id'         => $projet_id,
+        'user_id'           => $user_id,
+        'role_dans_projet'  => strtolower($role), // stocké en minuscule pour cohérence
+        'grade'             => $grade,
+        'email'             => $email,
+        'piece_jointe_path' => $piece_jointe_path,
+    ]);
+
+    if ($inserted) {
+        return new WP_REST_Response([
+            'success'       => true,
+            'id'            => $wpdb->insert_id,
+            'piece_jointe'  => $piece_jointe_path
+        ], 200);
+    } else {
+        return new WP_REST_Response([
+            'success'    => false,
+            'message'    => 'Erreur insertion',
+            'last_error' => $wpdb->last_error
+        ], 500);
+    }
+}
+
+
+function delete_projet_equipe(WP_REST_Request $req) {
+    global $wpdb;
+
+    $projet_id = intval($req['id']);
+    $membre_id = intval($req['membre_id']);
+
+    if (!$projet_id || !$membre_id) {
+        return new WP_REST_Response([
+            'success' => false,
+            'message' => 'Paramètres manquants'
+        ], 400);
+    }
+
+    $deleted = $wpdb->delete(
+        "utm_recherche_projet_equipe",
+        [ 'projet_id' => $projet_id, 'id' => $membre_id ],
+        [ '%d', '%d' ]
+    );
+
+    if ($deleted) {
+        return new WP_REST_Response([ 'success' => true ], 200);
+    } else {
+        return new WP_REST_Response([
+            'success' => false,
+            'message' => 'Échec suppression ou membre introuvable'
+        ], 400);
+    }
+}
+
+
+function add_projet_phase(WP_REST_Request $req) {
+    global $wpdb;
+
+    $projet_id   = intval($req['id']);
+    $titre_phase = sanitize_text_field($req->get_param('titre_phase'));
+    $etat        = sanitize_text_field($req->get_param('etat') ?: 'Prévu');
+    $membres     = $req->get_param('membres') ?: [];
+
+    $membres_json = !empty($membres) ? wp_json_encode($membres) : null;
+
+    $inserted = $wpdb->insert("utm_recherche_projet_phase", [
+        'projet_id'      => $projet_id,
+        'titre_phase'    => $titre_phase,
+        'etat'           => $etat,
+       // 'membres_json'   => $membres_json,
+        'created_by'     => get_current_user_id(),
+        'created_at'     => current_time('mysql')
+    ]);
+
+    if ($inserted) {
+        return new WP_REST_Response([
+            'success' => true,
+            'id'      => $wpdb->insert_id
+        ], 200);
+    } else {
+        return new WP_REST_Response([
+            'success' => false,
+            'message' => $wpdb->last_error ?: 'Erreur insertion'
+        ], 500);
+    }
+}
+
+
+function add_projet_tache(WP_REST_Request $req) {
+    global $wpdb;
+
+    $phase_id   = intval($req['phase_id']);
+    $titre      = sanitize_text_field($req->get_param('titre_tache'));
+    $etat       = sanitize_text_field($req->get_param('etat') ?: 'Prévu');
+    $membre_id  = intval($req->get_param('membre_id'));
+    $date_debut = sanitize_text_field($req->get_param('date_debut'));
+    $date_fin_prevu = sanitize_text_field($req->get_param('date_fin_prevu'));
+    $date_limite    = sanitize_text_field($req->get_param('date_limite'));
+
+    $inserted = $wpdb->insert("utm_recherche_projet_tache", [
+        'phase_id'      => $phase_id,
+        'titre_tache'   => $titre,
+        'membre_id'     => $membre_id ?: null,
+        'etat'          => $etat,
+        'date_debut'    => $date_debut ?: null,
+        'date_fin_prevu'=> $date_fin_prevu ?: null,
+        'date_limite'   => $date_limite ?: null,
+        'created_by'    => get_current_user_id(),
+    ], [
+        '%d','%s','%d','%s','%s','%s','%s','%d'
+    ]);
+
+    if ($inserted) {
+        return new WP_REST_Response([
+            'success' => true,
+            'id' => $wpdb->insert_id
+        ], 200);
+    } else {
+        return new WP_REST_Response([
+            'success' => false,
+            'message' => $wpdb->last_error ?: 'Erreur insertion'
+        ], 500);
+    }
+}
+
+
+class ProjetTacheService {
+
+    public static function get_taches_by_phase($phase_id) {
+        global $wpdb;
+        $table = "utm_recherche_projet_tache";
+
+        $sql = $wpdb->prepare("
+            SELECT t.*, u.display_name AS membre_nom, u.user_email AS membre_email
+            FROM $table t
+            LEFT JOIN {$wpdb->users} u ON t.membre_id = u.ID
+            WHERE t.phase_id = %d
+            ORDER BY t.date_debut ASC, t.id ASC
+        ", $phase_id);
+
+        return $wpdb->get_results($sql, ARRAY_A);
+    }
+
+    public static function get_tache($id) {
+        global $wpdb;
+        $table = "utm_recherche_projet_tache";
+        return $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id = %d", $id), ARRAY_A);
+    }
+
+    public static function insert_tache($phase_id, $data) {
+        global $wpdb;
+        $table = "utm_recherche_projet_tache";
+
+        $wpdb->insert($table, [
+            'phase_id'       => $phase_id,
+            'titre_tache'    => sanitize_text_field($data['titre_tache']),
+            'etat'           => sanitize_text_field($data['etat']),
+            'membre_id'      => intval($data['membre_id']),
+            'date_debut'     => $data['date_debut'] ?: null,
+            'date_fin_prevu' => $data['date_fin_prevu'] ?: null,
+            'date_limite'    => $data['date_limite'] ?: null,
+        ]);
+
+        return $wpdb->insert_id;
+    }
+
+    public static function update_tache($id, $data) {
+        global $wpdb;
+        $table = "utm_recherche_projet_tache";
+
+        return $wpdb->update($table, [
+            'titre_tache'    => sanitize_text_field($data['titre_tache']),
+            'etat'           => sanitize_text_field($data['etat']),
+            'membre_id'      => intval($data['membre_id']),
+            'date_debut'     => $data['date_debut'] ?: null,
+            'date_fin_prevu' => $data['date_fin_prevu'] ?: null,
+            'date_limite'    => $data['date_limite'] ?: null,
+        ], ['id' => intval($id)]);
+    }
+
+    public static function delete_tache($id) {
+        global $wpdb;
+        $table = "utm_recherche_projet_tache";
+        return $wpdb->delete($table, ['id' => intval($id)]);
+    }
+}
+
+
+function get_phase(WP_REST_Request $req) {
+    global $wpdb;
+    $id = intval($req['id']);
+
+    $phase = $wpdb->get_row($wpdb->prepare(
+        "SELECT * FROM utm_recherche_projet_phase WHERE id = %d", $id
+    ), ARRAY_A);
+
+    if ($phase) {
+        return $phase;
+    }
+    return new WP_REST_Response(['success' => false, 'message' => 'Phase introuvable'], 404);
+}
+
+
+function update_phase(WP_REST_Request $req) {
+    global $wpdb;
+    $id = intval($req['id']);
+
+    $fields = [];
+    if ($req->get_param('titre_phase')) {
+        $fields['titre_phase'] = sanitize_text_field($req->get_param('titre_phase'));
+    }
+    if ($req->get_param('etat')) {
+        $fields['etat'] = sanitize_text_field($req->get_param('etat'));
+    }
+
+
+    if (!$fields) {
+        return new WP_REST_Response(['success' => false, 'message' => 'Aucune donnée à mettre à jour'], 400);
+    }
+
+    $updated = $wpdb->update(
+        "utm_recherche_projet_phase",
+        $fields,
+        ['id' => $id]
+    );
+
+    if ($updated !== false) {
+        return new WP_REST_Response(['success' => true, 'id' => $id], 200);
+    }
+    return new WP_REST_Response(['success' => false, 'message' => $wpdb->last_error], 500);
+}
+
+
+function get_projet_budgets(WP_REST_Request $req) {
+    global $wpdb;
+    $projet_id = intval($req['id']);
+    $rows = $wpdb->get_results($wpdb->prepare(
+        "SELECT * FROM utm_recherche_projet_budget WHERE projet_id = %d ORDER BY id ASC",
+        $projet_id
+    ), ARRAY_A);
+    return $rows;
+}
+function add_projet_budget(WP_REST_Request $req) {
+    global $wpdb;
+    $projet_id = intval($req['id']);
+    $rubrique  = sanitize_text_field($req->get_param('rubrique'));
+    $montant_max = floatval($req->get_param('montant_max'));
+    $montant_alloue = floatval($req->get_param('montant_alloue'));
+    $current_user = get_current_user_id();
+
+    // fichier ?
+    $file_url = null;
+    if (!empty($_FILES['fichier']['name'])) {
+        require_once(ABSPATH . 'wp-admin/includes/file.php');
+        $upload = wp_handle_upload($_FILES['fichier'], ['test_form' => false]);
+        if (!isset($upload['error'])) {
+            $file_url = $upload['url'];
+        }
+    }
+
+    $wpdb->insert("utm_recherche_projet_budget", [
+        'projet_id' => $projet_id,
+        'rubrique' => $rubrique,
+        'montant_max' => $montant_max,
+        'montant_alloue' => $montant_alloue,
+        'fichier_justificatif' => $file_url,
+        'created_by' => $current_user
+    ]);
+
+    return ['success' => true, 'id' => $wpdb->insert_id];
+}
+
+function update_projet_budget(WP_REST_Request $req) {
+    global $wpdb;
+    $id = intval($req['id']);
+
+    // ⚠️ Si la requête est POST avec _method=PUT, utiliser $_POST
+    $rubrique = isset($_POST['rubrique']) ? sanitize_text_field($_POST['rubrique']) : $req->get_param('rubrique');
+    $montant_max = isset($_POST['montant_max']) ? floatval($_POST['montant_max']) : floatval($req->get_param('montant_max'));
+    $montant_alloue = isset($_POST['montant_alloue']) ? floatval($_POST['montant_alloue']) : floatval($req->get_param('montant_alloue'));
+
+    $data = [
+        'rubrique' => $rubrique,
+        'montant_max' => $montant_max,
+        'montant_alloue' => $montant_alloue,
+        'updated_by' => get_current_user_id(),
+        'updated_at' => current_time('mysql'),
+    ];
+
+    // ✅ Gestion fichier
+    if (!empty($_FILES['fichier']['name'])) {
+        require_once(ABSPATH . 'wp-admin/includes/file.php');
+        require_once(ABSPATH . 'wp-admin/includes/media.php');
+        require_once(ABSPATH . 'wp-admin/includes/image.php');
+        $attach_id = media_handle_upload('fichier', 0);
+        if (!is_wp_error($attach_id)) {
+            $data['fichier_justificatif'] = wp_get_attachment_url($attach_id);
+        }
+    }
+
+    $wpdb->update("utm_recherche_projet_budget", $data, ['id' => $id]);
+
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM utm_recherche_projet_budget WHERE id=%d", $id), ARRAY_A);
+
+    return [
+        'success' => true,
+        'id' => $id,
+        'rubrique' => $row['rubrique'],
+        'montant_max' => $row['montant_max'],
+        'montant_alloue' => $row['montant_alloue'],
+        'fichier_justificatif' => $row['fichier_justificatif'] ?? null
+    ];
+}
+
+
+
+function delete_projet_budget(WP_REST_Request $req) {
+    global $wpdb;
+    $id = intval($req['id']);
+    $wpdb->delete("utm_recherche_projet_budget", ['id' => $id]);
+    return ['success' => true];
+}
+
+function get_projet_budget(WP_REST_Request $req) {
+    global $wpdb;
+    $id = intval($req['id']);
+
+    $rubrique = $wpdb->get_row($wpdb->prepare(
+        "SELECT * FROM utm_recherche_projet_budget WHERE id = %d",
+        $id
+    ), ARRAY_A);
+
+    if (!$rubrique) {
+        return new WP_Error('not_found', 'Rubrique introuvable', ['status' => 404]);
+    }
+
+    return $rubrique;
+}
+
+
+function get_depense(WP_REST_Request $req) {
+    global $wpdb;
+    $id = intval($req['id']);
+
+    $sql = "SELECT d.*, b.rubrique AS rubrique_ref
+            FROM {$wpdb->prefix}recherche_projet_depenses d
+            LEFT JOIN {$wpdb->prefix}recherche_projet_budget b 
+                   ON d.budget_id = b.id
+            WHERE d.id = %d";
+    $depense = $wpdb->get_row($wpdb->prepare($sql, $id), ARRAY_A);
+
+    if (!$depense) {
+        return new WP_Error('not_found', 'Dépense introuvable', ['status' => 404]);
+    }
+    return $depense;
+}
+function update_depense(WP_REST_Request $req) {
+    global $wpdb;
+    $id = intval($req['id']);
+
+    $data = [
+        'budget_id' => intval($req->get_param('rubrique_id')),
+        'designation' => sanitize_text_field($req->get_param('designation')),
+        'montant'     => floatval($req->get_param('montant')),
+        'updated_at'  => current_time('mysql'),
+        'updated_by'  => get_current_user_id()
+    ];
+
+    // --- Upload fichier si fourni ---
+    if (!empty($_FILES['piece_jointe']['name'])) {
+        require_once(ABSPATH . 'wp-admin/includes/media.php');
+        require_once(ABSPATH . 'wp-admin/includes/file.php');
+        require_once(ABSPATH . 'wp-admin/includes/image.php');
+
+        $attach_id = media_handle_upload('piece_jointe', 0);
+        if (!is_wp_error($attach_id)) {
+            $data['piece_jointe'] = wp_get_attachment_url($attach_id);
+        }
+    }
+
+    $ok = $wpdb->update("{$wpdb->prefix}recherche_projet_depenses", $data, ['id' => $id]);
+    if ($ok === false) {
+        return new WP_Error('db_error', 'Erreur SQL update', ['status' => 500]);
+    }
+    return ['success' => true, 'id' => $id];
+}
+function delete_depense(WP_REST_Request $req) {
+    global $wpdb;
+    $id = intval($req['id']);
+    $ok = $wpdb->delete("{$wpdb->prefix}recherche_projet_depenses", ['id' => $id]);
+    if (!$ok) {
+        return new WP_Error('db_error', 'Erreur suppression', ['status' => 500]);
+    }
+    return ['success' => true, 'id' => $id];
+}
